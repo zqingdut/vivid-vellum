@@ -8306,7 +8306,7 @@ registerPlugin({id:'handwriting',name:'Handwriting',icon:'hand',
     const prevCap=h('span',null,'');const prevBox=h('div',{class:'preview'},prevCv,h('div',{class:'pspin'},'Updating…'));
     let prevTok=0,prevT=0;const prevHold={};
     const curImg=()=>{const w=wins.get(sel.value);return w&&w.img?w:null;};
-    async function runPreview(){const w=curImg();if(!w)return;const tok=++prevTok;if(prevHold.wk)prevHold.wk.terminate();prevBox.classList.add('busy');
+    async function runPreview(){const w=curImg();if(!w||busyBulk())return;const tok=++prevTok;if(prevHold.wk)prevHold.wk.terminate();prevBox.classList.add('busy');
       try{const P=prepInput(w,v,480);prevCv.style.aspectRatio=P.W+'/'+P.H;const res=await runEngine(P.input,null,prevHold);if(tok!==prevTok)return;paintRes(prevCv,res);prevBox.classList.remove('busy');}catch(e){if(tok===prevTok)prevBox.classList.remove('busy');}}
     function openLightbox(){const w=curImg();if(!w)return;const hold={},cv=h('canvas',{class:'lbcv','aria-label':'Large preview'}),sp=h('div',{class:'lbsp'},'Rendering…'),box=h('div',{class:'lbox',role:'dialog','aria-label':'Large preview'},cv,sp,h('button',{class:'lbx',type:'button','aria-label':'Close',onclick:()=>close()},'×'));
       const kd=e=>{if(e.key==='Escape')close();};function close(){if(hold.wk)hold.wk.terminate();box.remove();removeEventListener('keydown',kd);}addEventListener('keydown',kd);box.onclick=()=>close();document.body.append(box);
@@ -8319,7 +8319,7 @@ registerPlugin({id:'handwriting',name:'Handwriting',icon:'hand',
     const setPrevCap=()=>{prevCap.textContent=PRESETS[v.style].label+' · your settings';};
     for(const[k,pr]of Object.entries(PRESETS)){if(pr.hidden)continue;const cv=h('canvas',{class:'gthumb loading',width:280,height:187});
       const card=h('button',{type:'button',class:'scard',role:'radio','aria-checked':'false',title:pr.desc,onclick:()=>pick(k)},cv,h('b',null,pr.label),h('small',null,pr.desc));cards.set(k,{card,cv});gallery.append(card);}
-    async function refreshThumbs(){const w=curImg();if(!w){for(const c of cards.values())c.cv.classList.add('loading');return;}
+    async function refreshThumbs(){const w=curImg();if(!w){for(const c of cards.values())c.cv.classList.add('loading');return;}if(busyBulk())return; // look thumbnails and the preview are skipped while a video is being split or a workflow is drawing: they would compete with it for memory
       const key=w.id+'|'+w.img.src;if(key===thumbKey)return;thumbKey=key;markRecommended();const tok=++thumbTok;gallery.style.setProperty('--ar',w.img.naturalWidth+'/'+w.img.naturalHeight);
       for(const c of cards.values())c.cv.classList.add('loading');
       for(const[k,c]of cards){if(tok!==thumbTok)return;try{const P=prepInput(w,withCustom({...DEF,...PRESETS[k],size:150}),280);c.cv.style.aspectRatio=P.W+'/'+P.H;const res=await runEngine(P.input,null,{});if(tok!==thumbTok)return;paintRes(c.cv,res);}catch(e){}c.cv.classList.remove('loading');}}
@@ -9125,12 +9125,12 @@ function openVideoDlg(w){
     timeRow,filmRow,watchRow,status,bar,replayBtn,h('div',{class:'row'},go,close));
   close.onclick=()=>{if(busy){stop=true;cancelRun();status.textContent='Stopping…';return;}dlg.remove();};
   const prog=(p,m)=>{bar.hidden=false;bar.firstChild.style.width=Math.round(p*100)+'%';if(m)status.textContent=m;};
-  go.onclick=async()=>{if(busy)return;if(flowRun){toast('A workflow is already running');return;}busy=true;stop=false;go.disabled=true;close.textContent='Cancel';
+  go.onclick=async()=>{if(busy)return;if(flowRun){toast('A workflow is already running');return;}busy=true;vidBusy=true;stop=false;go.disabled=true;close.textContent='Cancel';
     let vd=null;try{
       prog(0,'Reading the video…');vd=await vidLoad(w.blob);const v=vd.v,dur=v.duration;if(!(dur>0))throw new Error('The video has no length');
       const fps=S.mode==='frames'?await vidFps(v):30;if(S.mode==='frames')await vidSeek(v,0);const shots=await vidShots(v,{mode:S.mode,max:0,count:S.count,nf:S.nf,fps,stop:()=>stop,progress:prog});
       if(shots.length>400&&S.form!=='frames'&&S.form!=='direct'&&!confirm(shots.length+' shots is a lot of drawing. Continue?'))throw new Error('Stopped');
-      const N=shots.length,side=N>200?480:N>80?640:N>24?960:1280,ar0=v.videoWidth/v.videoHeight; // the more shots, the smaller each picture: memory is what runs out first
+      const N=shots.length,side=N>200?480:N>80?640:N>=6?960:1280,ar0=v.videoWidth/v.videoHeight; // the more shots, the smaller each picture: memory is what runs out first
       let sheet=null,sc=null,snc=0,snr=0,scw=0,sch=0;
       if(S.form==='sheet'){snc=Math.min(N,Math.ceil(Math.sqrt(N*(ar0>1?1.6:0.8))));snr=Math.ceil(N/snc);scw=Math.round(Math.min(900,4096/snc));sch=Math.round(scw/ar0);sheet=document.createElement('canvas');sheet.width=scw*snc;sheet.height=sch*snr;sc=sheet.getContext('2d');sc.fillStyle='#fff';sc.fillRect(0,0,sheet.width,sheet.height);}
       const frames=[];for(let i=0;i<N;i++){if(stop)throw new Error('Stopped');prog(0.35+0.4*i/N,'Cutting shot '+(i+1)+' of '+N+'…');const s=shots[i],f=await vidFrame(v,s.t0+(s.t1-s.t0)*0.45,side);
@@ -9139,9 +9139,9 @@ function openVideoDlg(w){
       const cols=Math.min(frames.length>16?12:4,Math.ceil(Math.sqrt(frames.length*(ar>1?1.3:0.8)))),ww=(ar>=1?340:240)*(N>200?0.4:N>40?0.6:1),hh=Math.round(ww/ar)+34,ids=[],wsN=[];
       const x0=w.x,y0=w.y+w.h+90;
       for(let i=0;i<frames.length;i++){const f=new File([frames[i].blob],base+'-shot-'+pad(i+1)+'.jpg',{type:'image/jpeg'}),nwn=await createWindow({name:f.name,blob:f,mime:'image/jpeg',x:Math.round(x0+(i%cols)*(ww+40)),y:Math.round(y0+Math.floor(i/cols)*(hh+40)),w:ww,h:hh,bulk:frames.length>8});ids.push(nwn.id);wsN.push(nwn);if(i%6===5){prog(0.75+0.03*i/frames.length,'Placing shots '+(i+1)+' of '+frames.length+'…');await new Promise(r=>setTimeout(r,0));}}
-      refreshDock();notifyWins();setActive(ids[ids.length-1]);
+      refreshDock();
       prog(0.78,shots.length+' shots cut out');
-      const lite=N>150?0.45:N>60?0.6:N>24?0.8:1,optFor=()=>{const p={...DEF,...PRESETS[S.style]};return{...p,style:S.style,ratio,fit:'contain',animate:S.watch&&!reduceMotion&&N<=24,focus:true,detail:Math.round(p.detail*lite),colors:Math.max(5,Math.round((p.colors||8)*(lite<1?0.75:1)))};}; // many shots: lighter drawings (fewer strokes) and no live watching
+      const lite=N>150?0.45:N>60?0.6:N>24?0.8:1,optFor=()=>{const p={...DEF,...PRESETS[S.style]};return{...p,style:S.style,ratio,fit:'contain',animate:S.watch&&!reduceMotion&&N<=3,focus:true,detail:Math.round(p.detail*lite),colors:Math.max(5,Math.round((p.colors||8)*(lite<1?0.75:1)))};}; // many shots: lighter drawings (fewer strokes) and no live watching
       if(S.form==='frames'){flyTo(camForRect(unionRect(wsN.map(winRect)),60,1));toast(shots.length+' shots placed under the video');dlg.remove();return;}
       if(S.form==='direct'){ // no drawing: the shots themselves, each held for its original length, joined with the chosen transition
         const fl=flowFromPics(ids,{name:base+' (shots)',ratio,trans:S.trans,transDur:1,cfg:(c,id)=>{const i=ids.indexOf(id),len=frames[i].t1-frames[i].t0;c.kind='static';c.hold=clamp(Math.round(len*2)/2,0.5,30);c.fit='contain';}});
@@ -9156,17 +9156,21 @@ function openVideoDlg(w){
       const G={...defGrid(nc,nr)};dlg.remove();flyTo(camForRect(winRect(swin),60,1),500);
       const g=await handwrite(swin,{...optFor(),story:true,grid:G,ratio:'orig'});toast('Storyboard drawn');
     }catch(e){if(e.message!=='Stopped'){status.textContent='Failed: '+e.message;toast('Failed: '+e.message);console.error(e);}else status.textContent='Stopped.';}
-    finally{busy=false;go.disabled=false;close.textContent='Close';if(vd){URL.revokeObjectURL(vd.u);}}};
+    finally{busy=false;vidBusy=false;dirty();notifyWins();go.disabled=false;close.textContent='Close';if(vd){vd.v.pause();vd.v.removeAttribute('src');vd.v.load();URL.revokeObjectURL(vd.u);}}};
   sync();$('#app').append(dlg);}
 actions.push({id:'vid',icon:'video',title:'Redraw this video as hand-drawn shots',when:w=>w.kind==='video',run:w=>openVideoDlg(w)});
 
 /* ============ persistence (per-viewer convenience) ============ */
-let saveT=0,warned=false;function dirty(){clearTimeout(saveT);saveT=setTimeout(save,900);}
+let saveT=0,warned=false,saving=false,saveCost=0,vidBusy=false;
+const busyBulk=()=>vidBusy||(typeof flowRun!=='undefined'&&!!flowRun);
+/* autosave: copying every stroke of a big board into IndexedDB is expensive, so it waits for quiet moments (no drawing job, no workflow run, no video extraction), never overlaps itself, and backs off in proportion to how long the last save took */
+function dirty(){clearTimeout(saveT);saveT=setTimeout(trySave,Math.max(900,saveCost*8));}
+function trySave(){if(saving||vidBusy||(typeof job!=='undefined'&&job)||(typeof flowRun!=='undefined'&&flowRun)){clearTimeout(saveT);saveT=setTimeout(trySave,3000);return;}save();}
 const idb=()=>new Promise((res,rej)=>{try{const r=indexedDB.open('whiteboard-os',1);r.onupgradeneeded=()=>r.result.createObjectStore('kv');r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error);}catch(e){rej(e);}});
 async function kv(mode,k,v){const db=await idb();return new Promise((res,rej)=>{const tx=db.transaction('kv',mode==='get'?'readonly':'readwrite'),st=tx.objectStore('kv'),r=mode==='get'?st.get(k):st.put(v,k);tx.oncomplete=()=>res(r.result);tx.onerror=()=>rej(tx.error);tx.onabort=()=>rej(tx.error);});}
-async function save(){try{const snap={v:1,cam:{...cam},idc,zTop,results,
+async function save(){saving=true;const t0=performance.now();try{const snap={v:1,cam:{...cam},idc,zTop,results,
   wins:[...wins.values()].map(w=>({id:w.id,name:w.name,mime:w.mime,blob:w.text!=null?null:w.blob,text:w.text,x:w.x,y:w.y,w:w.w,h:w.h,z:w.z,min:w.min})),
-  strokes:strokes.map(s=>({p:s.p,c:s.c,w:s.w,g:s.g,a:s.a})),flows:flowSnap()};await kv('put','board',snap);$('#saved').textContent='saved locally';}catch(e){$('#saved').textContent='not saved';if(!warned){warned=true;}}}
+  strokes:strokes.map(s=>({p:s.p,c:s.c,w:s.w,g:s.g,a:s.a})),flows:flowSnap()};await kv('put','board',snap);$('#saved').textContent='saved locally';}catch(e){$('#saved').textContent='not saved';if(!warned){warned=true;}}finally{saving=false;saveCost=performance.now()-t0;}}
 async function restore(){try{const s=await kv('get','board');if(!s||!s.wins)return false;Object.assign(cam,s.cam);idc=s.idc||1;zTop=s.zTop||10;
   for(const w of s.wins)await createWindow({...w,restore:true});for(const o of s.strokes)strokes.push(mkStroke(o.p,o.c,o.w,o.g,o.a));results.push(...(s.results||[]));renderResults();flowRestore(s.flows);applyCam();
   return s.wins.length>0||s.strokes.length>0;}catch{return false;}}
