@@ -1,8 +1,12 @@
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <title>Vivid Vellum</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
+/* the board owns zoom: no browser pinch / double-tap zoom anywhere (scrolling still works) */
+*{touch-action:pan-x pan-y}input[type=range]{touch-action:pan-y}
+html,body{overscroll-behavior:none}
 /* Layout: full-bleed paper stage; floating tool rail (left), brand + zoom chips (top), plugin panel (right), dock (bottom). */
 :root{
   --paper:#fbfbf8; --dot:#cdd0d7;
@@ -323,6 +327,15 @@ body.focus #brushbar,body.nobars #brushbar{display:none!important}
 #workhud b{font-variant-numeric:tabular-nums;min-width:34px;text-align:right}
 #workhud .spin{width:14px;height:14px;border-radius:50%;border:2px solid color-mix(in srgb,var(--ui) 35%,transparent);border-top-color:var(--ui);animation:wspin .8s linear infinite}
 @keyframes wspin{to{transform:rotate(360deg)}}
+
+/* on-demand media controls (video / GIF windows) */
+.mediabody{overflow:hidden}.mediabody .mc-frozen{position:absolute;inset:0}
+.mctl{position:absolute;left:50%;bottom:8px;transform:translateX(-50%);display:flex;align-items:center;gap:7px;padding:3px 9px 3px 5px;border-radius:999px;background:rgba(20,22,30,.66);color:#fff;font-size:10px;line-height:1;opacity:0;pointer-events:none;transition:opacity .25s;z-index:5;max-width:calc(100% - 12px)}
+.mctl.show{opacity:1;pointer-events:auto}
+.mctl .mc-btn{width:22px;height:22px;padding:0;border:0;border-radius:50%;background:none;color:#fff;display:grid;place-items:center;cursor:pointer}
+.mctl .mc-btn:hover{background:rgba(255,255,255,.22)}
+.mctl input[type=range]{width:min(150px,28vw);height:3px;margin:0;accent-color:#fff}
+.mctl .mc-t{white-space:nowrap;opacity:.85}
 
 </style>
 <div id="app">
@@ -5855,6 +5868,44 @@ function makeEngine(progress){
     }
     return out;
   }
+  // Human stroke segmentation: an arm draws one simple arc at a time. Cut at sharp corners, at inflections (S-curves become two arcs),
+  // when too much turning piles up (spirals, loops) and when a stroke gets longer than a comfortable reach.
+  function humanSplit(p,Lmax,R){
+    const n0=p.length/2, L=plen(p); if(n0<4||L<Lmax*0.4) return [p];
+    const sp=Math.max(1.5,Lmax/80), N=Math.max(8,Math.round(L/sp)+1), st=L/(N-1);
+    const X=new Float32Array(N),Y=new Float32Array(N);
+    { let j=0,acc=0,seg=Math.hypot(p[2]-p[0],p[3]-p[1]); X[0]=p[0]; Y[0]=p[1];
+      for(let i=1;i<N;i++){ const tg=i*st; while(j<n0-2&&acc+seg<tg){ acc+=seg; j++; seg=Math.hypot(p[2*j+2]-p[2*j],p[2*j+3]-p[2*j+1]); }
+        const t=seg>0?clamp((tg-acc)/seg,0,1):0; X[i]=p[2*j]+(p[2*j+2]-p[2*j])*t; Y[i]=p[2*j+1]+(p[2*j+3]-p[2*j+1])*t; } }
+    if(Math.hypot(X[0]-X[N-1],Y[0]-Y[N-1])<st*2&&L<Lmax*0.7) return [p];
+    const wr=a=>{ while(a>Math.PI) a-=2*Math.PI; while(a<-Math.PI) a+=2*Math.PI; return a; };
+    const c=Math.max(2,Math.round(0.035*Lmax/st)), t=new Float32Array(N), ks=new Float32Array(N), tw=new Float32Array(N), ab=new Float32Array(N+1);
+    for(let i=1;i<N-1;i++) t[i]=wr(Math.atan2(Y[i+1]-Y[i],X[i+1]-X[i])-Math.atan2(Y[i]-Y[i-1],X[i]-X[i-1]));
+    for(let i=0;i<N;i++) ab[i+1]=ab[i]+Math.abs(t[i]);
+    for(let i=c;i<N-c;i++){ let s=0; for(let j=i-c;j<=i+c;j++) s+=t[j]; ks[i]=s;
+      tw[i]=Math.abs(wr(Math.atan2(Y[i+c]-Y[i],X[i+c]-X[i])-Math.atan2(Y[i]-Y[i-c],X[i]-X[i-c]))); }
+    const minS=Math.max(4,Math.round(0.14*Lmax/st)), cand=[];
+    for(let i=c;i<N-c;i++){ if(tw[i]<0.96) continue; let mx=true; for(let j=i-c;j<=i+c;j++) if(tw[j]>tw[i]||(tw[j]===tw[i]&&j<i)){ mx=false; break; } if(mx) cand.push({i,s:tw[i]}); }
+    // inflections: boundaries between runs of opposite turning, kept only if both neighbouring arcs really bend (>~35°)
+    { const eps=0.05, bs=[c]; let cur=0, lastNz=c;
+      for(let i=c;i<N-c;i++){ const sg=ks[i]>eps?1:ks[i]<-eps?-1:0; if(!sg) continue; if(cur&&sg!==cur) bs.push((lastNz+i)>>1); cur=sg; lastNz=i; }
+      bs.push(N-1-c);
+      const rt=[]; for(let r=0;r+1<bs.length;r++){ let s=0; for(let j=bs[r];j<bs[r+1];j++) s+=t[j]; rt.push(Math.abs(s)); }
+      for(let r=1;r+1<bs.length;r++) if(rt[r-1]>=0.6&&rt[r]>=0.6) cand.push({i:bs[r],s:1.0}); }
+    cand.sort((a,b)=>a.i-b.i);
+    const cuts=[]; for(const q of cand){ if(q.i<minS||N-1-q.i<minS) continue; const l=cuts[cuts.length-1];
+      if(l&&q.i-l.i<minS){ if(q.s>l.s&&(cuts.length<2||q.i-cuts[cuts.length-2].i>=minS)) cuts[cuts.length-1]=q; continue; } cuts.push(q); }
+    const idx=[0].concat(cuts.map(q=>q.i),[N-1]), segs=[];
+    const refine=(a,b)=>{ const len=(b-a)*st, hi=Lmax*(1.1+0.3*R()), turn=ab[b]-ab[a+1];
+      if(len<=hi&&turn<=3.3) { segs.push([a,b]); return; }
+      const lo=a+Math.max(minS,Math.round(0.35*(b-a))), up=a+Math.min(b-a-minS,Math.round(0.65*(b-a)));
+      if(up<lo||b-a<2*minS){ segs.push([a,b]); return; }
+      let bi=lo,bv=-1; for(let i=lo;i<=up;i++){ const v=tw[i]||0; if(v>bv){bv=v;bi=i;} }
+      refine(a,bi); refine(bi,b); };
+    for(let k=0;k+1<idx.length;k++) refine(idx[k],idx[k+1]);
+    if(segs.length<2) return [p];
+    return segs.map(([a,b])=>{ const q=new Float32Array((b-a+1)*2); for(let i=a;i<=b;i++){ q[2*(i-a)]=X[i]; q[2*(i-a)+1]=Y[i]; } return rdp(q,0.4); });
+  }
   function extend(q,f,maxPx){
     const n=q.length/2; if(n<2) return q; const o=q.slice();
     const L=plen(q), e=Math.min(maxPx,L*f);
@@ -5904,6 +5955,21 @@ function makeEngine(progress){
   }
 
   // Greedy pen-travel ordering with a spatial grid. pen={x,y} is carried across calls so the hand never teleports needlessly.
+  let HAND=null;
+  // Right-handed comfort of starting a stroke at one end: strokes like to run left-to-right / top-to-bottom, arcs counter-clockwise,
+  // and the hand moves on rightwards/downwards so it does not smear what is already drawn.
+  function handCost(p,isEnd,pen){
+    const n=p.length/2, lam=HAND.lam, j=Math.max(1,Math.min(n-1,Math.ceil(n*0.4))), m=n>>1;
+    const sx=isEnd?p[2*n-2]:p[0], sy=isEnd?p[2*n-1]:p[1], tj=isEnd?n-1-j:j, tm=m;
+    let ux=p[2*tj]-sx, uy=p[2*tj+1]-sy; const ul=Math.hypot(ux,uy)||1; ux/=ul; uy/=ul;
+    let cost=(1-(ux*0.62+uy*0.78))*0.5*lam;
+    const ex=isEnd?p[0]:p[2*n-2], ey=isEnd?p[1]:p[2*n-1], mx=p[2*tm], my=p[2*tm+1];
+    const ax=mx-sx, ay=my-sy, bx=ex-mx, by=ey-my, cr=(ax*by-ay*bx)/((Math.hypot(ax,ay)*Math.hypot(bx,by))||1);
+    cost+=lam*0.18*clamp(cr*1.5,-1,1);
+    const jx=sx-pen.x, jy=sy-pen.y, jl=Math.hypot(jx,jy);
+    if(jl>2) cost+=lam*0.2*(1-(jx*0.6+jy*0.8)/jl)*0.5;
+    return cost;
+  }
   function orderGrid(items,pen,W,H,fixed){
     const n=items.length; if(!n) return [];
     const cs=Math.max(6,Math.sqrt(W*H/Math.max(4,n))), gw=Math.ceil(W/cs)+2, gh=Math.ceil(H/cs)+2, cells=new Array(gw*gh);
@@ -5918,8 +5984,8 @@ function makeEngine(progress){
         for(let j=cy-r;j<=cy+r;j++){ if(j<0||j>=gh) continue; const edgeRow=(j===cy-r||j===cy+r);
           for(let i=cx-r;i<=cx+r;i+=(edgeRow||r===0?1:2*r)){ if(i<0||i>=gw) continue; const c=cells[j*gw+i]; if(!c) continue;
             for(let q=0;q<c.length;q++){ const e=c[q], it=e>>1; if(used[it]) continue; const p=items[it].pts, ex=(e&1)?p[p.length-2]:p[0], ey=(e&1)?p[p.length-1]:p[1];
-              const d=(ex-pen.x)**2+(ey-pen.y)**2; if(d<bd){bd=d;best=e;} } } }
-        if(best>=0&&r*cs>=Math.sqrt(bd)) break;
+              const dl=Math.hypot(ex-pen.x,ey-pen.y)+((HAND&&!fixed)?handCost(p,e&1,pen):0); if(dl<bd){bd=dl;best=e;} } } }
+        if(best>=0&&r*cs>=bd) break;
       }
       const it=best>>1; used[it]=1; const s=items[it]; if(best&1) s.pts=revPts(s.pts);
       out.push(s); pen.x=s.pts[s.pts.length-2]; pen.y=s.pts[s.pts.length-1];
@@ -6661,6 +6727,7 @@ function makeEngine(progress){
   /* ================= main ================= */
   function process(inp){
     const w=inp.w,h=inp.h,data=inp.data,o=inp.o,n=w*h, R=rng(o.seed||7);
+    HAND=o.humanStrokes?{lam:Math.max(w,h)*0.045}:null;
     progress(0.02,'Reading pixels');
     const rgb=new Uint8Array(n*3), lum=new Float32Array(n);
     for(let i=0;i<n;i++){ const a=data[i*4+3]/255; const r=data[i*4]*a+255*(1-a), g=data[i*4+1]*a+255*(1-a), b=data[i*4+2]*a+255*(1-a);
@@ -6735,7 +6802,7 @@ function makeEngine(progress){
         if(o.minStr&&mg<o.minStr) continue;
         if(o.inkOnly){ const LB=getLab(); let hit=0; for(let i=0;i<p.length&&!hit;i+=2){ const x0=Math.round(p[i]),y0=Math.round(p[i+1]); for(let dy=-2;dy<=2&&!hit;dy++)for(let dx=-2;dx<=2;dx++){ const x=x0+dx,y=y0+dy; if(x<0||y<0||x>=w||y>=h) continue; const k=y*w+x; if(LB.L[k]<o.inkOnly||Math.hypot(LB.A[k],LB.B[k])>28){ hit=1; break; } } } if(!hit) continue; }
         let q=movAvg(Float32Array.from(p),o.detail>0.5?1:2); q=o.pencil?cornerRdp(q,spanEps(q,dsc)):rdp(q,0.5);
-        for(const piece of splitLong(q,Lmax,R)){
+        for(const piece of (o.humanStrokes?humanSplit(q,Lmax*0.8,R):splitLong(q,Lmax,R))){
           if(piece.length<4) continue; const L=plen(piece);
           let v=o.pencil?chaikinKeep(piece,cornerFlags(piece,60),2):chaikin(piece,2); v=wobble(v,wob*0.5,R);
           cont.push({pts:Array.from(v),str:mg,len:L,score:mg*Math.sqrt(L),sal:salOf(v)});
@@ -6831,7 +6898,29 @@ function makeEngine(progress){
         const s0=0.4+0.6*sm(Math.min(1,u/0.1)), e0=0.12+0.88*sm(Math.min(1,(1-u)/0.35)), env=1+(s0*e0-1)*k, fm=0.7+0.65*sg[i], dr=1+0.1*Math.sin(cum[i]/(26*scaleRef)+ph)+0.06*Math.sin(cum[i]/(9*scaleRef)+2*ph);
         wv[i]=clamp(env*fm*(1+0.2*cv*k)*dr*1.05,0.14,1.7); }
       for(let p=0;p<2;p++){ const t=Float32Array.from(wv); for(let i=1;i<N-1;i++) wv[i]=(t[i-1]+2*t[i]+t[i+1])/4; } return wv; };
-    const ORD=(items,pen,nb)=>o.partOrder===false?bandOrder(items,focalKey,nb||2,pen,w,h):partOrder(items,pen);
+    /* A drawing plan written by a vision model: o.plan={parts:[{name,order,poly:[[x,y]..] | box:[x0,y0,x1,y1] (all 0..1), speed,pressure,pause}]}.
+       The rough layout is snapped to the real colour regions, then it decides the order parts are drawn in, how fast the pen moves and how hard it presses. */
+    let PLAN=null; const planInit=()=>{ if(PLAN!==null) return PLAN||null; const P=o.plan&&o.plan.parts; if(!P||!P.length){ PLAN=false; return null; }
+      const pm=o.plan.snap===false?null:(o.partMap||autoSeg()), gw=pm?pm.w:Math.min(256,w), gh=pm?pm.h:Math.max(1,Math.round(h*gw/w)), lab=new Uint8Array(gw*gh);
+      P.forEach((q,k)=>{ let poly=q.poly; if(!(poly&&poly.length>=3)&&q.box){ const b=q.box; poly=[[b[0],b[1]],[b[2],b[1]],[b[2],b[3]],[b[0],b[3]]]; } if(!poly||poly.length<3) return;
+        const pts=poly.map(v=>[v[0]*gw,v[1]*gh]), y0=Math.max(0,Math.floor(Math.min(...pts.map(v=>v[1])))), y1=Math.min(gh-1,Math.ceil(Math.max(...pts.map(v=>v[1]))));
+        for(let y=y0;y<=y1;y++){ const yy=y+0.5, xs=[]; for(let i=0;i<pts.length;i++){ const a=pts[i], b=pts[(i+1)%pts.length]; if((a[1]<=yy&&b[1]>yy)||(b[1]<=yy&&a[1]>yy)) xs.push(a[0]+(yy-a[1])*(b[0]-a[0])/(b[1]-a[1])); }
+          xs.sort((a,b)=>a-b); for(let i=0;i+1<xs.length;i+=2){ const xa=Math.max(0,Math.ceil(xs[i]-0.5)), xb=Math.min(gw-1,Math.floor(xs[i+1]-0.5)); for(let x=xa;x<=xb;x++) lab[y*gw+x]=k+1; } } });
+      if(pm&&pm.part){ let mx=0; for(let i=0;i<pm.part.length;i++) if(pm.part[i]>mx) mx=pm.part[i]; const K=P.length+1, cnt=new Uint32Array((mx+1)*K);
+        for(let i=0;i<lab.length;i++) cnt[pm.part[i]*K+lab[i]]++;
+        const rl=new Int16Array(mx+1).fill(-1); for(let r=0;r<=mx;r++){ let t=0,b=0,bl=0; for(let l=0;l<K;l++){ const c=cnt[r*K+l]; t+=c; if(c>b){b=c;bl=l;} } if(t&&b/t>=0.6) rl[r]=bl; }
+        for(let i=0;i<lab.length;i++){ const l=rl[pm.part[i]]; if(l>=0) lab[i]=l; } }
+      PLAN={lab,gw,gh,P}; return PLAN; };
+    const planLabel=s=>{ const L=PLAN, p=s.pts, m=p.length>>1, v=new Uint16Array(L.P.length+1); for(let k=0;k<5;k++){ const i=Math.min(m-1,Math.round((k+0.5)/5*m)), x=Math.max(0,Math.min(L.gw-1,(p[2*i]*L.gw/w)|0)), y=Math.max(0,Math.min(L.gh-1,(p[2*i+1]*L.gh/h)|0)); v[L.lab[y*L.gw+x]]++; }
+      let b=0,bl=0; for(let l=1;l<v.length;l++) if(v[l]>b){b=v[l];bl=l;} return bl; };
+    const planOrder=(items,pen)=>{ const L=planInit(), G=new Map(); for(const s of items){ const l=planLabel(s); (G.get(l)||G.set(l,[]).get(l)).push(s); }
+      const ord=l=>l?(+L.P[l-1].order||l):1e9, ls=[...G.keys()].sort((a,b)=>ord(a)-ord(b)), out=[]; let cur={x:pen.x,y:pen.y};
+      for(const l of ls){ const q=l?L.P[l-1]:null, its=G.get(l).slice().sort((a,b)=>(b.w*Math.sqrt(plen(b.pts)))-(a.w*Math.sqrt(plen(a.pts)))), cut=Math.max(1,Math.ceil(its.length*0.4));
+        const part=orderGrid(its.slice(0,cut),cur,w,h).concat(orderGrid(its.slice(cut),cur,w,h));
+        if(q){ const sp=clamp(+q.speed||1,0.3,3), pr=clamp(+q.pressure||1,0.5,2); for(const s of part){ s.sp=sp; s.w*=pr; } if(+q.pause>0&&part.length) part[0].ph=clamp(+q.pause,0,6); }
+        for(const s of part){ out.push(s); } if(part.length){ const lp=part[part.length-1].pts; cur={x:lp[lp.length-2],y:lp[lp.length-1]}; } }
+      return out; };
+    const ORD=(items,pen,nb)=>planInit()?planOrder(items,pen):o.partOrder===false?bandOrder(items,focalKey,nb||2,pen,w,h):partOrder(items,pen);
     const outlinesLast=(fills)=>{ const maj=cont.filter(c=>majorSet.has(c)).map(c=>mkOut(c)), mino=cont.filter(c=>!majorSet.has(c)).map(c=>mkOut(c)); const pn={x:pen0.x,y:pen0.y};
       return fills.concat(bandOrder(maj,focalKey,2,pn,w,h).concat(orderGrid(mino,pn,w,h)).map(s=>({pts:Float32Array.from(s.pts),color:s.color,w:s.w,a:s.a}))); };
 
@@ -6844,7 +6933,7 @@ function makeEngine(progress){
       if(o.outlineFirst){ // ink-wash masters: the structure is set down first with the brush, washes follow light to dark, the last accents come at the end
         const faint=o.outline<=0.02, fo=faint?{a:0.34,w:outW*0.6}:null; // a brush look without outlines still starts with a faint pencil drawing of the forms, which the paint then covers
         const mj=cont.filter(c=>majorSet.has(c)).map(c=>mkOut(c,fo||{a:clamp(outA*0.65,0.1,1)})), mi=cont.filter(c=>!majorSet.has(c)).map(c=>mkOut(c,fo||undefined));
-        const strip=a=>a.map(s=>({pts:Float32Array.from(s.pts),color:s.color,w:s.w,a:s.a}));
+        const strip=a=>a.map(s=>({pts:Float32Array.from(s.pts),color:s.color,w:s.w,a:s.a,sp:s.sp,ph:s.ph}));
         const first=strip(ORD((faint?mj.concat(mi):mj).sort((a,b)=>b.pts.length-a.pts.length).slice(0,faint?220:160),pn)), body=paintStrokes(rgb,w,h,P,R), last=faint?[]:strip(orderGrid(mi.length>140?mi.sort((a,b)=>b.pts.length-a.pts.length).slice(0,140):mi,pn,w,h));
         return finish(first.concat(body,last));
       }
@@ -6930,7 +7019,7 @@ function makeEngine(progress){
       for(const p of lp){ let q=movAvg(Float32Array.from(p),2); q=rdp(q,0.9); if(q.length<4) continue; const pts=Array.from(wobble(chaikin(q,1),wob*0.25,R)); leads.push({pts,color:o.outlineColor||'#17171d',w:pen*lerp(1.4,2.4,o.outline)*(o.outW||1)*(o.lead==null?1:o.lead),a:1,sal:salOf(pts),len:plen(pts)}); }
       const leadOrder=()=>{ const ls=leads.map(l=>({pts:l.pts.slice(),color:l.color,w:l.w,a:l.a,sal:l.sal,len:l.len})).sort((a,b)=>b.len-a.len), cut=Math.ceil(ls.length*0.4);
         return orderGrid(ls.slice(0,cut),pn,w,h).concat(orderGrid(ls.slice(cut),pn,w,h)); };
-      const strip=a=>a.map(s=>({pts:Float32Array.from(s.pts),color:s.color,w:s.w,a:s.a}));
+      const strip=a=>a.map(s=>({pts:Float32Array.from(s.pts),color:s.color,w:s.w,a:s.a,sp:s.sp,ph:s.ph}));
       // 1. the cartoon: the whole design in thin pencil, the lead pattern the glazier will follow (main figure first)
       const cartoon=bandOrder(leads.map(l=>({pts:l.pts.slice(),color:'#5a5a64',w:Math.max(1,pen*0.5),a:0.38,sal:l.sal})),l=>-l.sal,3,pn,w,h);
       // 2. panes of glass, one at a time: quiet background panes first, the figure last; each pane is filled with lines of its own colour
@@ -6993,7 +7082,7 @@ function makeEngine(progress){
       flushUnits();
       // outlines last, big forms before small details, grouped by travel
       const maj=cont.filter(c=>majorSet.has(c)).map(c=>mkOut(c)), mino=cont.filter(c=>!majorSet.has(c)).map(c=>mkOut(c));
-      const strip=a=>a.map(s=>({pts:Float32Array.from(s.pts),color:s.color,w:s.w,a:s.a}));
+      const strip=a=>a.map(s=>({pts:Float32Array.from(s.pts),color:s.color,w:s.w,a:s.a,sp:s.sp,ph:s.ph}));
       if(o.outlineFirst) UD=true;
       if(o.outlineFirst){ // Chinese meticulous painting: fine, even ink lines first, colour washes laid inside them, then the strongest lines are gone over again
         const lines=strip(ORD(cont.map(c=>mkOut(c)),{x:pen0.x,y:pen0.y},3)).map(s=>{s.ln=1;if(o.dynW) s.wv=dynW(s.pts);return s;}); // ln: this stroke belongs to the line-art pass, so the app can keep a copy of it
@@ -7169,6 +7258,7 @@ const I18N=(()=>{
     'Basic pen':'基础笔','Fountain pen':'钢笔','Pencil':'铅笔','Charcoal':'炭笔','Marker':'马克笔','Watercolour brush':'水彩笔','Quill':'蘸水笔',
     'Brush: each one behaves differently on every paper':'画笔：每支笔在不同的纸上效果都不一样','Paper: changes how every brush behaves':'画纸：不同的纸会改变每支笔的效果','Paper: parchment, watercolour, Kent':'画纸：羊皮纸、水彩纸、肯特纸',
     // compose image
+    'Hand-sized strokes (split long winding lines, draw them the right-handed way)':'仿手绘分笔（长而弯绕的线拆成多笔，按右手习惯的方向和顺序画）',
     'Draw part by part (finish one figure, face first, before the next)':'按部位连贯绘制（先画完一个人物，脸优先，再画下一个）','Runs on your CPU. ':'会占用 CPU。','The picture is split into figures and parts first, which adds about 2 s per megapixel (not shown in the preview). Turn it off for very large pictures or for a quick draft.':'绘制前要先把图分成人物和部位，每百万像素约多花 2 秒（预览里看不到）。图片很大或只想快速出草稿时请关闭。',
     'Flash the original picture now and then while drawing':'绘制时每隔几秒闪回原图','Show the original every (seconds)':'每隔多少秒显示一次原图','How long it stays (0.1–1 s)':'显示多久（0.1–1 秒）',
     'Drag to move this bar':'拖动可移动这个工具栏','Move the brush bar':'移动画笔工具栏',
@@ -7889,13 +7979,17 @@ function ribbonPath(c,p,w,wv){const n=p.length>>1;c.beginPath();const R=i=>Math.
   for(let i=1;i<n;i++){const x0=p[2*i-2],y0=p[2*i-1],x1=p[2*i],y1=p[2*i+1],r0=R(i-1),r1=R(i),d=Math.hypot(x1-x0,y1-y0),st=Math.max(1,Math.ceil(d/Math.max(0.5,Math.min(r0,r1)*0.45)));for(let k=(i===1?0:1);k<=st;k++){const t=k/st,x=x0+(x1-x0)*t,y=y0+(y1-y0)*t,r=r0+(r1-r0)*t;c.moveTo(x+r,y);c.arc(x,y,r,0,6.2832);}}}
 function addPath(c,p){c.moveTo(p[0],p[1]);for(let i=2;i<p.length;i+=2)c.lineTo(p[i],p[i+1]);if(p.length===2)c.lineTo(p[0]+0.01,p[1]);}
 const liveC=$('#live'),lctx=liveC.getContext('2d');
+let inkErr=0;
 function drawStrokeList(c,list,vx0,vy0,vx1,vy1){let key=null,open=false;
   for(const s of list){if(s.bx1<vx0||s.bx0>vx1||s.by1<vy0||s.by0>vy1)continue;
-    if(s.b){if(open){c.stroke();open=false;key=null;}brushStroke(c,s);continue;}
-    if(s.wv){if(open){c.stroke();open=false;key=null;}c.globalAlpha=s.a;c.fillStyle=INK(s.c,s.p);ribbonPath(c,s.p,s.w,s.wv);c.fill();c.globalAlpha=1;continue;}
-    if(s.a<1){if(open){c.stroke();open=false;key=null;}c.globalAlpha=s.a;c.beginPath();c.strokeStyle=INK(s.c,s.p);c.lineWidth=s.w;addPath(c,s.p);c.stroke();c.globalAlpha=1;continue;}
+    try{drawOne(s);}catch(e){ /* one bad stroke must never blank the whole board */ try{c.restore();}catch(_){} c.globalAlpha=1;open=false;key=null;if(!inkErr++)console.error('stroke skipped',e); }}
+  if(open)c.stroke();
+  function drawOne(s){
+    if(s.b){if(open){c.stroke();open=false;key=null;}brushStroke(c,s);return;}
+    if(s.wv){if(open){c.stroke();open=false;key=null;}c.globalAlpha=s.a;c.fillStyle=INK(s.c,s.p);ribbonPath(c,s.p,s.w,s.wv);c.fill();c.globalAlpha=1;return;}
+    if(s.a<1){if(open){c.stroke();open=false;key=null;}c.globalAlpha=s.a;c.beginPath();c.strokeStyle=INK(s.c,s.p);c.lineWidth=s.w;addPath(c,s.p);c.stroke();c.globalAlpha=1;return;}
     const k=s.c+'|'+s.w;if(k!==key){if(open)c.stroke();c.beginPath();c.strokeStyle=INK(s.c,s.p);c.lineWidth=s.w;key=k;open=true;}addPath(c,s.p);}
-  if(open)c.stroke();}
+}
 function renderInk(){const d=devicePixelRatio||1,W=stage.clientWidth,H=stage.clientHeight;for(const c of[ink,liveC])if(c.width!==Math.round(W*d)||c.height!==Math.round(H*d)){c.width=Math.round(W*d);c.height=Math.round(H*d);}
   ictx.setTransform(1,0,0,1,0,0);ictx.clearRect(0,0,ink.width,ink.height);setInkTransform();
   drawStrokeList(ictx,strokes,-cam.x/cam.z,-cam.y/cam.z,-cam.x/cam.z+W/cam.z,-cam.y/cam.z+H/cam.z);drawLive();}
@@ -8264,10 +8358,30 @@ const mdRender=src=>{const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').r
   return o;};
 const url=w=>{const u=URL.createObjectURL(w.blob);return u;};
 const kindOf=(w,re,exts)=>re.test(w.mime)||exts.includes(extOf(w.name));
+/* Small on-demand player controls for video and GIF windows: hidden until the window is clicked, gone again two seconds later */
+function mediaCtl(body,el,opt={}){
+  const gif=!!opt.gif,P='<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M7 4.5v15l13-7.5z"/></svg>',Q='<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M6 4h4v16H6zM14 4h4v16h-4z"/></svg>';
+  const btn=h('button',{type:'button',class:'mc-btn','aria-label':'Play or pause'}),bar=h('div',{class:'mctl'},btn);let rng=null,tm=null,frozen=null,t=0;
+  const fmt=x=>{x=Math.max(0,x|0);return(x/60|0)+':'+String(x%60).padStart(2,'0');};
+  const playing=()=>gif?!frozen:!el.paused&&!el.ended,paint=()=>{btn.innerHTML=playing()?Q:P;};
+  const poke=()=>{bar.classList.add('show');clearTimeout(tm);tm=setTimeout(()=>{if(!bar.matches(':active'))bar.classList.remove('show');},2000);};
+  const toggle=()=>{if(gif){if(frozen){frozen.remove();frozen=null;el.style.visibility='';}else{const c=document.createElement('canvas');c.width=el.naturalWidth;c.height=el.naturalHeight;try{c.getContext('2d').drawImage(el,0,0);}catch(e){return;}c.className='fit-img mc-frozen';el.after(c);el.style.visibility='hidden';frozen=c;}}
+    else if(el.paused||el.ended)el.play().catch(()=>{});else el.pause();paint();poke();};
+  btn.onclick=e=>{e.stopPropagation();toggle();};
+  if(!gif){const time=h('span',{class:'mc-t'},'0:00');rng=h('input',{type:'range',min:0,max:1000,value:0,step:1,'aria-label':'Position'});
+    rng.oninput=()=>{if(el.duration)el.currentTime=el.duration*rng.value/1000;time.textContent=fmt(el.currentTime);poke();};
+    el.addEventListener('timeupdate',()=>{if(el.duration&&document.activeElement!==rng)rng.value=Math.round(el.currentTime/el.duration*1000);time.textContent=fmt(el.currentTime)+' / '+fmt(el.duration||0);});
+    for(const ev of['play','pause','ended'])el.addEventListener(ev,paint);bar.append(rng,time);}
+  bar.addEventListener('pointerdown',e=>{e.stopPropagation();poke();});bar.addEventListener('input',poke);
+  const show=e=>{if(bar.contains(e.target))return;poke();};
+  body.addEventListener('pointerup',show);body.append(bar);paint();
+  return{destroy(){clearTimeout(tm);body.removeEventListener('pointerup',show);}};}
 registerHandler({id:'image',icon:'image',match:w=>kindOf(w,/^image\//,['png','jpg','jpeg','gif','webp','bmp','svg','avif','ico']),
   async mount(w,body){const u=url(w);const img=new Image();img.draggable=false;img.className='fit-img';img.src=u;try{await img.decode();}catch{throw new Error('Unsupported image');}body.append(img);w.img=img;
-    if(w.autosize){const ar=img.naturalHeight/img.naturalWidth||1,ww=clamp(img.naturalWidth,260,520);w.resize(ww,Math.round(ww*ar)+34);}return{destroy(){URL.revokeObjectURL(u);}};}});
-registerHandler({id:'video',icon:'video',match:w=>kindOf(w,/^video\//,['mp4','webm','mov','m4v']),async mount(w,b){const u=url(w);b.append(h('video',{src:u,controls:true,playsinline:true}));return{destroy(){URL.revokeObjectURL(u);}};}});
+    if(w.autosize){const ar=img.naturalHeight/img.naturalWidth||1,ww=clamp(img.naturalWidth,260,520);w.resize(ww,Math.round(ww*ar)+34);}
+    let mc=null;if(/gif/i.test(w.mime||'')||extOf(w.name)==='gif'){body.classList.add('mediabody');mc=mediaCtl(body,img,{gif:true});}
+    return{destroy(){if(mc)mc.destroy();URL.revokeObjectURL(u);}};}});
+registerHandler({id:'video',icon:'video',match:w=>kindOf(w,/^video\//,['mp4','webm','mov','m4v']),async mount(w,b){const u=url(w);const v=h('video',{src:u,playsinline:true,loop:false,preload:'metadata'});b.append(v);b.classList.add('mediabody');const ui=mediaCtl(b,v);return{destroy(){ui.destroy();URL.revokeObjectURL(u);}};}});
 registerHandler({id:'audio',icon:'audio',match:w=>kindOf(w,/^audio\//,['mp3','wav','ogg','m4a','flac']),async mount(w,b){const u=url(w);b.append(h('audio',{src:u,controls:true}));return{destroy(){URL.revokeObjectURL(u);}};}});
 registerHandler({id:'pdf',icon:'doc',match:w=>kindOf(w,/pdf/,['pdf']),async mount(w,body){body.append(h('div',{class:'load'},'Loading PDF…'));
   await loadLib(CDN+'pdf.js/3.11.174/pdf.min.js');const L=window.pdfjsLib;L.GlobalWorkerOptions.workerSrc=CDN+'pdf.js/3.11.174/pdf.worker.min.js';
@@ -8302,9 +8416,9 @@ registerHandler({id:'binary',icon:'file',match:()=>true,async mount(w,body){cons
 
 /* ============ pointer: pan, zoom, pen, eraser ============ */
 let tool='select',penColor='#1d1f27',penSize=3,brushId='basic',space=false,pinch=null;const ptrs=new Map();
-function setTool(t){tool=t;stage.dataset.tool=t;ink.style.pointerEvents=(t==='pen'||t==='eraser'||t==='dropper')?'auto':'none';const bb=$('#brushbar');if(bb){bb.hidden=!(t==='pen'||t==='eraser'||t==='dropper');syncBrushbar();}$$('#tools [data-tool]').forEach(b=>b.setAttribute('aria-pressed',b.dataset.tool===t));$('#erasercur').hidden=true;try{updSel();}catch(_){}}
+function setTool(t){tool=t;stage.dataset.tool=t;ptrs.clear();pinch=null;pan=null;stage.classList.remove('panning');try{if(cur&&!cur.drop&&!cur.erase)cancelStroke();}catch(_){}ink.style.pointerEvents=(t==='pen'||t==='eraser'||t==='dropper')?'auto':'none';const bb=$('#brushbar');if(bb){bb.hidden=!(t==='pen'||t==='eraser'||t==='dropper');syncBrushbar();}$$('#tools [data-tool]').forEach(b=>b.setAttribute('aria-pressed',b.dataset.tool===t));$('#erasercur').hidden=true;try{updSel();}catch(_){}}
 let pan=null;function startPan(e){pan={x:e.clientX,y:e.clientY,cx:cam.x,cy:cam.y,id:e.pointerId};stage.setPointerCapture(e.pointerId);stage.classList.add('panning');flyStop();}
-stage.addEventListener('pointerdown',e=>{if(e.pointerType==='touch'){ptrs.set(e.pointerId,{x:e.clientX,y:e.clientY});if(ptrs.size===2){cancelStroke();pan=null;const[a,b]=[...ptrs.values()];pinch={d:Math.hypot(a.x-b.x,a.y-b.y)||1,z:cam.z,wx:((a.x+b.x)/2-cam.x)/cam.z,wy:((a.y+b.y)/2-cam.y)/cam.z};return;}}
+stage.addEventListener('pointerdown',e=>{if(e.pointerType==='touch'){if(e.isPrimary){ptrs.clear();pinch=null;if(pan&&pan.id!==e.pointerId){pan=null;stage.classList.remove('panning');}}ptrs.set(e.pointerId,{x:e.clientX,y:e.clientY});if(ptrs.size===2){cancelStroke();pan=null;const[a,b]=[...ptrs.values()];pinch={d:Math.hypot(a.x-b.x,a.y-b.y)||1,z:cam.z,wx:((a.x+b.x)/2-cam.x)/cam.z,wy:((a.y+b.y)/2-cam.y)/cam.z};return;}}
   if(pinch)return;if(e.button===0&&tool==='select'&&!space&&selPointer(e))return;if(e.target!==stage&&e.target!==ink&&e.target!==winsLayer)return;
   if(e.button===0&&tool==='select'&&!space&&e.target!==ink){const r=hitResult(toWorld(e.clientX,e.clientY));selectResult(r);if(r){e.preventDefault();startResDrag(e,r);return;}}
   if(e.button===1||(e.button===0&&(tool==='select'||space))){if(e.target===ink&&!(e.button===1||space))return;e.preventDefault();startPan(e);}},true);
@@ -8318,6 +8432,11 @@ stage.addEventListener('wheel',e=>{const body=e.target.closest&&e.target.closest
   const mouse=e.deltaMode===1||(e.deltaX===0&&Math.abs(e.deltaY)>=50&&Number.isInteger(e.deltaY));
   if(e.ctrlKey)zoomAt(sx,sy,Math.exp(-e.deltaY*0.01));else if(mouse)zoomAt(sx,sy,Math.exp(-Math.sign(e.deltaY)*Math.min(Math.abs(e.deltaY),120)*0.0012));else{cam.x-=e.deltaX;cam.y-=e.deltaY;applyCam();}},{passive:false});
 
+/* The board owns every zoom gesture. The browser's own page zoom (pinch, double-tap, ctrl+wheel outside the board, iOS gesture events) is switched off so the two never fight and the page never ends up scaled. */
+for(const ev of['gesturestart','gesturechange','gestureend'])document.addEventListener(ev,e=>e.preventDefault(),{passive:false});
+addEventListener('wheel',e=>{if(e.ctrlKey&&!e.defaultPrevented)e.preventDefault();},{passive:false});
+document.addEventListener('touchmove',e=>{if(e.touches.length>1&&e.cancelable)e.preventDefault();},{passive:false});
+addEventListener('blur',()=>{ptrs.clear();pinch=null;});document.addEventListener('visibilitychange',()=>{ptrs.clear();pinch=null;});
 /* a drawn canvas (result) can be selected and dragged: its frame, picture area, regions and every stroke move together */
 let selG=null;
 function hitResult(q){for(let i=results.length-1;i>=0;i--){const r=results[i].rect;if(q.x>=r.x&&q.x<=r.x+r.w&&q.y>=r.y&&q.y<=r.y+r.h)return results[i];}return null;}
@@ -8490,7 +8609,7 @@ const PRESETS={
  gongbi:{label:'Chinese fine-line painting',desc:'Delicate ink outlines first, then thin layers of mineral colour inside them',tip:'pen',mode:'color',outlineFirst:true,detail:85,colors:16,pen:1.5,loose:0,shake:8,outline:80,alpha:0.82,passes:1,outW:0.7,outAlpha:0.95,outlineColor:'#2b2420'},
  ghibli:{label:'Storybook anime',desc:'Soft, bright painted colour with fine warm outlines',tip:'marker',mode:'paint',layout:true,brush:'ghibli',detail:70,pen:2.2,loose:10,shake:15,outline:65,alpha:1,passes:1,outW:0.6,outAlpha:0.9,outlineColor:'#5a3f3a'},
  clear:{label:'Clear line (Moebius)',desc:'Even, clean ink outlines first (a copy of the line art is kept on the board), then quiet flat colour inside them',tip:'pen',mode:'color',outlineFirst:true,lineCopy:true,vivid:80,detail:75,colors:9,pen:1.6,fillPen:3,loose:0,shake:4,outline:90,alpha:1,passes:1,outW:0.85,outAlpha:1,outlineColor:'#1b1b22'},
- lineart:{label:'Line art (clean contours)',desc:'Only the contours, drawn figure by figure from the head down with a pen that presses and lifts like a hand (thick-thin lines), no colour',tip:'pen',mode:'color',outlineFirst:true,lineOnly:true,dynW:true,vivid:80,detail:75,colors:9,pen:1.6,fillPen:3,loose:0,shake:4,outline:90,alpha:1,passes:1,outW:1.2,outAlpha:1,outlineColor:'#1b1b22'},
+ lineart:{label:'Line art (clean contours)',desc:'Only the contours, drawn figure by figure from the head down with a pen that presses and lifts like a hand (thick-thin lines), no colour',tip:'pen',mode:'color',outlineFirst:true,lineOnly:true,dynW:true,humanStrokes:true,vivid:80,detail:75,colors:9,pen:1.6,fillPen:3,loose:0,shake:4,outline:90,alpha:1,passes:1,outW:1.2,outAlpha:1,outlineColor:'#1b1b22'},
  cel:{label:'Anime cel',desc:'Line art, flat base colours, hard-edged shadows, then bright highlights last',tip:'pen',mode:'color',outlineFirst:true,vivid:115,detail:80,colors:16,pen:1.5,fillPen:2.6,loose:0,shake:6,outline:85,alpha:1,passes:1,outW:0.8,outAlpha:1,outlineColor:'#3a2a30'},
  ukiyo:{label:'Woodblock print',desc:'Bold key lines, then a few flat blocks of colour, like an ukiyo-e print',tip:'pen',mode:'color',outlineFirst:true,vivid:90,detail:60,colors:7,pen:2,fillPen:3.4,fillGrow:0.45,loose:6,shake:10,outline:80,alpha:0.95,passes:1,outW:1.1,outAlpha:1,outlineColor:'#241b17'},
  flat:{label:'Flat vector + grain',desc:'Simple flat shapes laid far to near, with a soft printed grain over fine contour lines',tip:'marker',mode:'color',outlineFirst:true,vivid:105,detail:50,colors:10,pen:2.4,fillPen:3,loose:4,shake:8,outline:65,alpha:1,passes:1,outW:0.55,outAlpha:0.85,outlineColor:'#2a2a33',grain:'soft'},
@@ -8517,7 +8636,7 @@ function prepInput(win,opt,pw,sub){
   const cv=document.createElement('canvas');cv.width=W;cv.height=H;const c=cv.getContext('2d',{willReadFrequently:true});c.fillStyle='#fff';c.fillRect(0,0,W,H);c.imageSmoothingQuality='high';if(crop)c.drawImage(img,crop.sx,crop.sy,crop.sw,crop.sh,0,0,W,H);else c.drawImage(img,0,0,W,H);const id=c.getImageData(0,0,W,H);
   {const vv=(opt.vivid??100)/100,cc=(opt.contrast??100)/100;if(vv!==1||cc!==1){const d=id.data;for(let i=0;i<d.length;i+=4){const l=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2];for(let k=0;k<3;k++){let x=l+(d[i+k]-l)*vv;x=(x-128)*cc+128;d[i+k]=x<0?0:x>255?255:x;}}}}
   let pen=opt.pen/scale;if(pw)pen=Math.max(1,pen*1.25);
-  const o={mode:opt.mode,detail,colors:opt.colors,pen,loose:opt.loose/100,shake:opt.shake/100,outline:(opt.lines===false&&(opt.mode==='paint'||opt.mode==='color')?0:opt.outline/100),tone:opt.tone/100,ink:opt.ink,outlineColor:opt.outlineColor||'#1d1d22',skipPaper:true,seed:7,alpha:opt.alpha??1,passes:opt.passes||1,outW:opt.outW||0.9,outAlpha:opt.outAlpha??1,lineOnly:!!opt.lineOnly,pencil:!!opt.pencil,brush:opt.brush,dotColor:!!opt.dotColor,layout:!!opt.layout&&!(opt.lines===false&&opt.mode==='paint'),outlineFirst:opt.outlineFirst!==false&&(!!opt.outlineFirst||opt.mode==='paint'||opt.mode==='color')&&!(opt.lines===false&&(opt.mode==='paint'||opt.mode==='color')),order:opt.order||null,finishRegion:!!opt.finishRegion,grain:opt.grain==='soft'?'soft':!!opt.grain,subjects:!!opt.story,grid:opt.story?gridCells(opt.grid||defGrid()).map(q=>({x:q.x*W,y:q.y*H,w:q.w*W,h:q.h*H})):null,bigBrush:(opt.big??100)/100,fillPen:opt.fillPen,minStr:opt.minStr,bgClean:(opt.bgClean??50)/100,stick:opt.style==='stick',fixAng:opt.fixAng,closeGap:opt.closeGap,dynW:opt.dynW,partOrder:opt.partOrder,partMap:opt.partMap,segment:opt.segment,fillGrow:opt.fillGrow,painter:opt.painter,skel:opt.skel!==false,glassA:(opt.glassA??100)/100,lead:(opt.lead??100)/100};
+  const o={mode:opt.mode,detail,colors:opt.colors,pen,loose:opt.loose/100,shake:opt.shake/100,outline:(opt.lines===false&&(opt.mode==='paint'||opt.mode==='color')?0:opt.outline/100),tone:opt.tone/100,ink:opt.ink,outlineColor:opt.outlineColor||'#1d1d22',skipPaper:true,seed:7,alpha:opt.alpha??1,passes:opt.passes||1,outW:opt.outW||0.9,outAlpha:opt.outAlpha??1,lineOnly:!!opt.lineOnly,pencil:!!opt.pencil,brush:opt.brush,dotColor:!!opt.dotColor,layout:!!opt.layout&&!(opt.lines===false&&opt.mode==='paint'),outlineFirst:opt.outlineFirst!==false&&(!!opt.outlineFirst||opt.mode==='paint'||opt.mode==='color')&&!(opt.lines===false&&(opt.mode==='paint'||opt.mode==='color')),order:opt.order||null,finishRegion:!!opt.finishRegion,grain:opt.grain==='soft'?'soft':!!opt.grain,subjects:!!opt.story,grid:opt.story?gridCells(opt.grid||defGrid()).map(q=>({x:q.x*W,y:q.y*H,w:q.w*W,h:q.h*H})):null,bigBrush:(opt.big??100)/100,fillPen:opt.fillPen,minStr:opt.minStr,bgClean:(opt.bgClean??50)/100,stick:opt.style==='stick',fixAng:opt.fixAng,closeGap:opt.closeGap,dynW:opt.dynW,partOrder:opt.partOrder,partMap:opt.partMap,segment:opt.segment,plan:opt.plan,humanStrokes:!!opt.humanStrokes,fillGrow:opt.fillGrow,painter:opt.painter,skel:opt.skel!==false,glassA:(opt.glassA??100)/100,lead:(opt.lead??100)/100};
   return{input:{w:W,h:H,data:id.data,o},scale,outW,outH,W,H,crop};}
 function paintRes(cv,res){cv.width=res.w;cv.height=res.h;const c=cv.getContext('2d');paperFillM(c,res.w,res.h,1,0,0);c.lineCap='round';c.lineJoin='round';
   for(const s of res.strokes){const p=s.pts;c.globalAlpha=s.a;c.strokeStyle=INK(s.color,s.pts);c.lineWidth=s.w;c.beginPath();c.moveTo(p[0],p[1]);for(let i=2;i<p.length;i+=2)c.lineTo(p[i],p[i+1]);if(p.length===2)c.lineTo(p[0]+.01,p[1]);c.stroke();}c.globalAlpha=1;}
@@ -8541,7 +8660,7 @@ async function cellsPass(win,opt,{g,x0,y0,outW,outH}){
     const sopt={...opt,story:false,pen:Math.max(0.9,opt.pen*penK),grid:null,bgClean:0},P=prepInput(win,sopt,0,sub),scale=P.scale;
     const ox=x0+sub.x*outW,oy=y0+sub.y*outH;
     const res=await runEngine(P.input,(p,m)=>ui.progress&&ui.progress((k+p)/N,'Cell '+(k+1)+' of '+N),true);
-    for(const s of res.strokes){const p=new Float32Array(s.pts.length);for(let i=0;i<p.length;i+=2){p[i]=ox+s.pts[i]*scale;p[i+1]=oy+s.pts[i+1]*scale;}const m=mkStroke(p,s.color,s.w*scale,g,s.a);if(s.f)m.f=1;if(s.wv)m.wv=s.wv;m.r=k;list.push(m);}
+    for(const s of res.strokes){const p=new Float32Array(s.pts.length);for(let i=0;i<p.length;i+=2){p[i]=ox+s.pts[i]*scale;p[i+1]=oy+s.pts[i+1]*scale;}const m=mkStroke(p,s.color,s.w*scale,g,s.a);if(s.f)m.f=1;if(s.wv)m.wv=s.wv;if(s.sp)m.sp=s.sp;if(s.ph)m.ph=s.ph;m.r=k;list.push(m);}
   }
   /* continuity across cells: shades of one colour that were quantised separately (the headband red, the smoke grey, the ink black) are merged into one shared palette, so the same thing keeps the same colour from cell to cell */
   if(opt.style==='stick'){const W8=new Map();for(const s of list){if(typeof s.c==='string'&&s.c.length===7&&s.c[0]==='#')W8.set(s.c,(W8.get(s.c)||0)+1+s.p.length/4);}
@@ -8571,7 +8690,7 @@ async function handwrite(win,opt,{instant}={}){
   if(!instant)workHud.show();
   try{res=await runEngine(P.input,(p,m)=>{workHud.set(p,m);ui.progress&&ui.progress(p,m);},true);}catch(e){workHud.hide();const i=results.indexOf(entry);if(i>=0)results.splice(i,1);renderResults();throw e;}
   workHud.hide();
-  list=res.strokes.map(s=>{const p=new Float32Array(s.pts.length);for(let i=0;i<p.length;i+=2){p[i]=x0+ox+s.pts[i]*scale;p[i+1]=y0+oy+s.pts[i+1]*scale;}const m=mkStroke(p,s.color,s.w*scale,g,s.a);if(s.f)m.f=1;if(s.wv)m.wv=s.wv;if(s.r!=null)m.r=s.r;if(s.ln)m.ln=1;return m;});
+  list=res.strokes.map(s=>{const p=new Float32Array(s.pts.length);for(let i=0;i<p.length;i+=2){p[i]=x0+ox+s.pts[i]*scale;p[i+1]=y0+oy+s.pts[i+1]*scale;}const m=mkStroke(p,s.color,s.w*scale,g,s.a);if(s.f)m.f=1;if(s.wv)m.wv=s.wv;if(s.sp)m.sp=s.sp;if(s.ph)m.ph=s.ph;if(s.r!=null)m.r=s.r;if(s.ln)m.ln=1;return m;});
   }
   if(!cellMode&&res.regions&&res.regions.length>=2){entry.regions=res.regions.map(q=>({x:x0+ox+q.x*scale,y:y0+oy+q.y*scale,w:q.w*scale,h:q.h*scale}));entry.grid=true;}
   entry.n=list.length;renderResults();
@@ -8580,7 +8699,7 @@ async function handwrite(win,opt,{instant}={}){
   const keepLines=()=>{const src=list.filter(s=>s.ln);if(!src.length)return;let cx=x0+fw+48;
     for(let k=0;k<40&&hit(cx);k++){const bl=[...wins.values()].filter(w=>w!==win).map(winRect).concat(results.map(r=>r.rect)).concat(flows.map(f=>({x:f.x,y:f.y-48,w:f.w,h:f.h+48}))).filter(r=>cx<r.x+r.w&&cx+fw>r.x&&y0<r.y+r.h&&y0+fh>r.y);if(!bl.length)break;cx=Math.max(...bl.map(r=>r.x+r.w))+48;}
     const cg=g+'L',dx=cx-x0,ce={g:cg,src:win.id,name:win.name+' · line art',rect:{x:cx,y:y0,w:fw,h:fh},img:{x:cx+ox,y:y0+oy,w:outW,h:outH},crop:P.crop||null,tip:opt.tip||'pencil',n:src.length,regions:null,lineArt:true};
-    results.push(ce);const cl=src.map(s=>{const p=new Float32Array(s.p);for(let i=0;i<p.length;i+=2)p[i]+=dx;const m=mkStroke(p,s.c,s.w,cg,s.a);if(s.f)m.f=1;if(s.wv)m.wv=s.wv;return m;});
+    results.push(ce);const cl=src.map(s=>{const p=new Float32Array(s.p);for(let i=0;i<p.length;i+=2)p[i]+=dx;const m=mkStroke(p,s.c,s.w,cg,s.a);if(s.f)m.f=1;if(s.wv)m.wv=s.wv;if(s.sp)m.sp=s.sp;if(s.ph)m.ph=s.ph;return m;});
     for(const m of cl)strokes.push(m);scheduleInk(true);renderResults();dirty();};
   const aOpt=(grp,from,span)=>({duration:(opt.duration==null?18:opt.duration)*span,group:grp,tipStyle:tipPref||opt.tip,kind:opt.tip,moods:moodsPref,onProgress:p=>ui.progress&&ui.progress(from+p*span,'Drawing '+Math.round((from+p*span)*100)+'%')});
   if(instant||!opt.animate){addStrokesInstant(list);if(nLn)keepLines();}
@@ -8664,7 +8783,7 @@ registerPlugin({id:'handwriting',name:'Handwriting',icon:'hand',
     const inkRow=h('div',{class:'ctl',id:'hw-inkrow'},h('span',{class:'ctl-h'},'Pencil / pen colour'));
     const inkIn=h('input',{type:'color',value:v.ink,id:'hw-ink','aria-label':'Custom ink colour'});
     const inkSw=h('div',{class:'inksw'},...['#1d1f27','#2c2c33','#3b4a6b','#6b4a2f','#7a1f1f'].map(c=>h('button',{type:'button',class:'sw',style:'background:'+c,title:c,'aria-label':'Ink '+c,onclick:()=>{v.ink=c;inkIn.value=c;touched.add('ink');schedulePreview();}})),inkIn);inkIn.oninput=()=>{v.ink=inkIn.value;touched.add('ink');schedulePreview();};inkRow.append(inkSw);
-    const linesCb=h('input',{type:'checkbox',id:'hw-lines',checked:v.lines!==false,onchange:()=>{v.lines=linesCb.checked;ctl.outline.el.hidden=!v.lines||v.mode==='stipple';schedulePreview();}}),linesRow=h('label',{class:'tog'},linesCb,h('span',null,'Draw outlines (off = fills and brush strokes only)')),skelCb=h('input',{type:'checkbox',id:'hw-skel',checked:v.skel!==false,onchange:()=>{v.skel=skelCb.checked;schedulePreview();}}),skelRow=h('label',{class:'tog'},skelCb,h('span',null,'Rough skeleton first (block in the big forms, then add detail)'));const segCb=h('input',{type:'checkbox',id:'hw-seg',checked:v.segment!==false,onchange:()=>{v.segment=segCb.checked;v.partOrder=segCb.checked;schedulePreview();}}),segRow=h('div',{class:'ctl'},h('label',{class:'tog'},segCb,h('span',null,'Draw part by part (finish one figure, face first, before the next)')),h('p',{class:'cpunote'},h('b',null,'Runs on your CPU. '),'The picture is split into figures and parts first, which adds about 2 s per megapixel (not shown in the preview). Turn it off for very large pictures or for a quick draft.'));
+    const linesCb=h('input',{type:'checkbox',id:'hw-lines',checked:v.lines!==false,onchange:()=>{v.lines=linesCb.checked;ctl.outline.el.hidden=!v.lines||v.mode==='stipple';schedulePreview();}}),linesRow=h('label',{class:'tog'},linesCb,h('span',null,'Draw outlines (off = fills and brush strokes only)')),skelCb=h('input',{type:'checkbox',id:'hw-skel',checked:v.skel!==false,onchange:()=>{v.skel=skelCb.checked;schedulePreview();}}),skelRow=h('label',{class:'tog'},skelCb,h('span',null,'Rough skeleton first (block in the big forms, then add detail)'));const segCb=h('input',{type:'checkbox',id:'hw-seg',checked:v.segment!==false,onchange:()=>{v.segment=segCb.checked;v.partOrder=segCb.checked;schedulePreview();}}),hsCb=h('input',{type:'checkbox',id:'hw-hs',checked:!!v.humanStrokes,onchange:()=>{v.humanStrokes=hsCb.checked;schedulePreview();}}),hsRow=h('label',{class:'tog'},hsCb,h('span',null,'Hand-sized strokes (split long winding lines, draw them the right-handed way)')),segRow=h('div',{class:'ctl'},h('label',{class:'tog'},segCb,h('span',null,'Draw part by part (finish one figure, face first, before the next)')),h('p',{class:'cpunote'},h('b',null,'Runs on your CPU. '),'The picture is split into figures and parts first, which adds about 2 s per megapixel (not shown in the preview). Turn it off for very large pictures or for a quick draft.'));
     const controls=[
       slider('detail','Detail',0,100,1,x=>word(x,0,100,['Rough','Simple','Balanced','Detailed','Very fine'])),
       slider('outline','Outlines',0,100,1,x=>word(x,0,101,['None','Faint','Medium','Strong','Bold'])),
@@ -8675,7 +8794,7 @@ registerPlugin({id:'handwriting',name:'Handwriting',icon:'hand',
       slider('big','Broad-brush fill',0,100,1,x=>x<8?'Off':x<40?'Slight':x<75?'Medium':'Strong'),
       slider('loose','Neatness',0,100,1,x=>word(x,0,101,['Very neat','Neat','Relaxed','Loose','Scribbly'])),
       slider('bgClean','Background clean-up',0,100,1,x=>x<1?'Off':x<30?'Light':x<65?'Auto':'Strong'),
-      slider('glassA','Glass colour',0,100,1,x=>x<1?'No glass (lead lines only)':x+'%'),slider('lead','Lead line thickness',30,220,1,x=>x+'%'),inkRow,linesRow,skelRow,segRow];
+      slider('glassA','Glass colour',0,100,1,x=>x<1?'No glass (lead lines only)':x+'%'),slider('lead','Lead line thickness',30,220,1,x=>x+'%'),inkRow,linesRow,skelRow,hsRow,segRow];
     const resetBtn=h('button',{type:'button',class:'btn small',onclick:()=>pick(v.style)},'Reset sliders');
     const lockMsg=h('small',{class:'ctl-help'},''),saveBtn=h('button',{type:'button',class:'btn small primary'},'Save as default'),unlockBtn=h('button',{type:'button',class:'btn small'},'Unlock');
     function refreshLock(){lockMsg.textContent=CUSTOM.on?'Locked: your saved settings apply to every look.':'Not locked: each look uses its own settings.';unlockBtn.hidden=!CUSTOM.on;for(const key of Object.keys(ctl))if(ctl[key].lock)ctl[key].lock.hidden=!(CUSTOM.on&&key in CUSTOM.vals);}
@@ -8695,9 +8814,9 @@ registerPlugin({id:'handwriting',name:'Handwriting',icon:'hand',
     const storyCb=h('input',{type:'checkbox',id:'hw-story'});storyCb.onchange=()=>{v.story=storyCb.checked;syncStory();};const storyTog=h('label',{class:'tog'},storyCb,h('span',null,'Draw by grid, one cell at a time (camera moves appear in the exported video)'));
     const animTog=h('label',{class:'tog'},anim,h('span',null,'Watch it being drawn (untick to draw instantly)'));
     /* ---- picking a style ---- */
-    function pick(k){const pr=PRESETS[k];if(pr.story){v.story=true;syncStory();showTab('story');}for(const key of['label','desc','tip','mode','detail','colors','pen','loose','shake','outline','tone','ink','alpha','passes','outW','outAlpha','outlineColor','lineOnly','pencil','brush','dotColor','grain'])if(pr[key]!==undefined||key==='lineOnly'||key==='pencil'||key==='brush'||key==='dotColor'||key==='grain')v[key]=pr[key];v.style=k;if(!pr.ink)v.ink=DEF.ink;for(const key of['outlineFirst','fillPen','fillGrow','minStr','layout','painter','fixAng','lineCopy','dynW'])v[key]=pr[key];for(const key of['vivid','contrast','big','glassA','lead','bgClean'])v[key]=pr[key]!==undefined?pr[key]:DEF[key];if(CUSTOM.on)for(const key of Object.keys(CUSTOM.vals))if(CK.includes(key))v[key]=CUSTOM.vals[key];touched.clear();inkIn.value=v.ink;
+    function pick(k){const pr=PRESETS[k];if(pr.story){v.story=true;syncStory();showTab('story');}for(const key of['label','desc','tip','mode','detail','colors','pen','loose','shake','outline','tone','ink','alpha','passes','outW','outAlpha','outlineColor','lineOnly','pencil','brush','dotColor','grain'])if(pr[key]!==undefined||key==='lineOnly'||key==='pencil'||key==='brush'||key==='dotColor'||key==='grain')v[key]=pr[key];v.style=k;if(!pr.ink)v.ink=DEF.ink;for(const key of['outlineFirst','fillPen','fillGrow','minStr','layout','painter','fixAng','lineCopy','dynW','humanStrokes'])v[key]=pr[key];for(const key of['vivid','contrast','big','glassA','lead','bgClean'])v[key]=pr[key]!==undefined?pr[key]:DEF[key];if(CUSTOM.on)for(const key of Object.keys(CUSTOM.vals))if(CK.includes(key))v[key]=CUSTOM.vals[key];touched.clear();inkIn.value=v.ink;
       for(const key of Object.keys(ctl))if(key!=='duration'&&key!=='size')ctl[key].set();
-      const isC=v.mode==='color',isP=v.mode==='paint',tonal=v.mode==='sketch'||v.mode==='skeleton'||v.mode==='stipple'||v.mode==='engrave';ctl.colors.el.hidden=!isC;ctl.big.el.hidden=!isP;inkRow.hidden=!tonal||!!v.dotColor;v.lines=true;linesCb.checked=true;linesRow.hidden=!(v.mode==='paint'||v.mode==='color');segRow.hidden=!(v.mode==='paint'||v.mode==='color'||v.mode==='engrave');ctl.outline.el.hidden=v.mode==='stipple';ctl.glassA.el.hidden=ctl.lead.el.hidden=v.mode!=='glass';refreshLock();
+      const isC=v.mode==='color',isP=v.mode==='paint',tonal=v.mode==='sketch'||v.mode==='skeleton'||v.mode==='stipple'||v.mode==='engrave';ctl.colors.el.hidden=!isC;ctl.big.el.hidden=!isP;inkRow.hidden=!tonal||!!v.dotColor;v.lines=true;linesCb.checked=true;linesRow.hidden=!(v.mode==='paint'||v.mode==='color');segRow.hidden=!(v.mode==='paint'||v.mode==='color'||v.mode==='engrave');hsRow.hidden=segRow.hidden;hsCb.checked=!!v.humanStrokes;ctl.outline.el.hidden=v.mode==='stipple';ctl.glassA.el.hidden=ctl.lead.el.hidden=v.mode!=='glass';refreshLock();
       cards.forEach((c,key)=>{c.card.setAttribute('aria-checked',String(key===k));});setPrevCap();schedulePreview();}
     /* ---- run / progress ---- */
     const bar=h('div',{class:'progress',hidden:true},h('i')),status=h('p',{class:'hint'},'');const go=h('button',{class:'btn primary',id:'hw-go'},'Draw on board');
@@ -8815,8 +8934,8 @@ function replayRig(sec,penMode,opt={}){if(opt.flow)return flowRig(opt.flow,opt);
   const airTotal=hops?sec*0.2:0,speed=total/Math.max(0.3,sec-airTotal),airK=sq?airTotal/sq:0,segs=[];let T=0,P=0;
   for(let i=0;i<list.length;i++){const d=gaps[i],adur=airK*Math.sqrt(d),q=i?list[i-1].p:list[0].p,p=list[i].p;
     if(rcAt(i)){const dur=book?(i?0.9:0.5):(i?2.2:1.6);segs.push({k:0,pause:1,drop:book&&i?1:0,next:pageOf[i],i,t0:T,t1:T+dur,x0:i?q[q.length-2]:p[0],y0:i?q[q.length-1]:p[1],x1:p[0],y1:p[1],d:i?d:0});T+=dur;P+=dur;}
-    else if(i&&d>3&&adur>=0.06){const dur=Math.min(1.4,adur);segs.push({k:0,i,t0:T,t1:T+dur,x0:q[q.length-2],y0:q[q.length-1],x1:p[0],y1:p[1],d});T+=dur;}
-    const vary=1+0.16*(Math.sin(i*0.071)*0.6+Math.sin(i*0.0293+1.7)*0.4),dd=costs[i]/speed*vary;segs.push({k:1,i,t0:T,t1:T+dd});T+=dd;}
+    else if(i&&((d>3&&adur>=0.06)||list[i].ph)){const dur=((d>3&&adur>=0.06)?Math.min(1.4,adur):0)+(list[i].ph||0)*0.35;segs.push({k:0,i,t0:T,t1:T+dur,x0:q[q.length-2],y0:q[q.length-1],x1:p[0],y1:p[1],d});T+=dur;}
+    const vary=1+0.16*(Math.sin(i*0.071)*0.6+Math.sin(i*0.0293+1.7)*0.4),dd=costs[i]/speed*vary/(list[i].sp||1);segs.push({k:1,i,t0:T,t1:T+dd});T+=dd;}
   if(book){const lp=list[list.length-1].p,NP=pages.length,ex=lp[lp.length-2],ey=lp[lp.length-1];
     // after the last cell: the hand leaves, the stacked pages are turned over one by one from the top (curling like real paper), and when only the first is left every picture scatters like stars, then gathers into the whole picture
     const mkS=o=>{segs.push(Object.assign({k:0,pause:1,i:list.length-1,t0:T,t1:T+o.du,x0:ex,y0:ey,x1:ex,y1:ey,d:0},o));T+=o.du;if(!o.flipall)P+=o.du;};
@@ -9042,6 +9161,23 @@ async function recordReplay(sec,penMode,onP,opt={}){
   await new Promise(fin=>{const frame=now=>{const t=(now-t0)/1000;if(cancelled||t>=rig.dur){fin();return;}rig.draw(t);onP&&onP(Math.min(1,t/rig.dur),'Recording in real time…');requestAnimationFrame(frame);};requestAnimationFrame(frame);});
   rec.stop();await done;try{asrc&&asrc.stop();actx&&actx.close();}catch(e){}recJob=null;if(cancelled)return null;
   return{blob:new Blob(chunks,{type:ext==='mp4'?'video/mp4':'video/webm'}),ext,mode:'live',audio:actx?'live':null};}
+/* Animated GIF: frames are drawn offline at a low frame rate and a small size, then palette-quantised and LZW-packed. The result loops forever. */
+async function recordGif(sec,penMode,onP,opt={}){
+  const rig=replayRig(sec,penMode,{...opt,sound:false,music:'none'}),fps=opt.gifFps||12,maxW=opt.gifW||480,k=Math.min(1,maxW/rig.cw),gw=Math.max(2,Math.round(rig.cw*k)),gh=Math.max(2,Math.round(rig.ch*k)),N=Math.max(2,Math.ceil(rig.dur*fps));
+  const sm=document.createElement('canvas');sm.width=gw;sm.height=gh;const sc=sm.getContext('2d',{willReadFrequently:true});sc.imageSmoothingQuality='high';
+  let cancelled=false;recJob={cancel:()=>{cancelled=true;}};
+  try{const hist=new Uint32Array(32768),frames=[],t0=performance.now();
+    for(let f=0;f<N;f++){if(cancelled)return null;
+      rig.draw(f/fps);sc.drawImage(rig.cv,0,0,gw,gh);const d=sc.getImageData(0,0,gw,gh).data,K=new Uint16Array(gw*gh);
+      for(let i=0,j=0;i<K.length;i++,j+=4)K[i]=((d[j]>>3)<<10)|((d[j+1]>>3)<<5)|(d[j+2]>>3);
+      frames.push(K);if(f%3===0||f===N-1)for(let i=0;i<K.length;i+=2)hist[K[i]]++;
+      if(f%3===2){onP&&onP(0.05+0.6*f/N,'Drawing frame '+(f+1)+' of '+N);await yieldUI();}}
+    onP&&onP(0.7,'Choosing colours…');await yieldUI();
+    const {pal,n}=GIF.palette(hist),delays=frames.map((_,i)=>i===N-1?Math.round(150):Math.max(2,Math.round(100/fps)));
+    onP&&onP(0.8,'Packing the GIF…');await yieldUI();
+    const blob=GIF.encode(frames,gw,gh,delays,pal,n);
+    return{blob,ext:'gif',mode:'gif',frames:N,w:gw,h:gh,secs:(performance.now()-t0)/1000};
+  }finally{recJob=null;}}
 async function makeReplayVideo(sec,penMode,onP,opt={}){
   if(opt.fast!==false){try{const r=await recordMB(sec,penMode,onP,opt);if(r!==false)return r;}catch(e){console.warn('Mediabunny export failed, trying the built-in muxer',e);}
     try{const r=await recordFast(sec,penMode,onP,opt);if(r!==false)return r;}catch(e){console.warn('Fast export failed, falling back to real-time recording',e);}}
@@ -9114,7 +9250,7 @@ $('#app').append(expMenu);
 function closeExport(){expMenu.hidden=true;$('#exportbtn').setAttribute('aria-pressed','false');}
 $('#exportbtn').onclick=e=>{e.stopPropagation();expMenu.hidden=!expMenu.hidden;$('#exportbtn').setAttribute('aria-pressed',String(!expMenu.hidden));};
 addEventListener('pointerdown',e=>{if(!expMenu.hidden&&!expMenu.contains(e.target)&&!$('#exportbtn').contains(e.target))closeExport();});
-let replayPeek=false,replayPeekEvery=5,replayPeekHold=0.3,replaySrc=false,replayFlipT=0.5,replayFlipOnly=false,replayBook=false,replaySec=15,replayPen='hand',replayRev=true,replaySnd=false,replayMusic='none',replayMusicVol=50,replayCover=true;
+let replayPeek=false,replayPeekEvery=5,replayPeekHold=0.3,replaySrc=false,replayFlipT=0.5,replayFlipOnly=false,replayBook=false,replaySec=15,replayPen='hand',replayRev=true,replaySnd=false,replayMusic='none',replayMusicVol=50,replayCover=true,replayFmt='video';
 function openReplayDlg(target){if($('#replaydlg'))return;
   const fastOK=typeof VideoEncoder!=='undefined'&&typeof Mp4Muxer!=='undefined';
   const chips=h('div',{class:'chips'}),status=h('p',{class:'hint'},fastOK?'Rendered faster than real time: a 30 s video usually takes a few seconds. You can switch tabs while it works.':'This browser records in real time, so a 20 s video takes about 20 s (plus a short ending). Keep this tab open and in front.'),bar=h('div',{class:'progress'},h('i'));
@@ -9135,22 +9271,25 @@ function openReplayDlg(target){if($('#replaydlg'))return;
     pkBox=h('div',{class:'ctl',hidden:!replayPeek},h('span',{class:'ctl-h'},'Show the original every (seconds)'),h('div',{class:'row'},pkEv,pkEvOut),h('span',{class:'ctl-h'},'How long it stays (0.1–1 s)'),h('div',{class:'row'},pkHd,pkHdOut)),
     pkCb=h('input',{type:'checkbox',checked:replayPeek,onchange:e=>{replayPeek=e.target.checked;pkBox.hidden=!replayPeek;}});
   const go=h('button',{class:'btn primary',id:'rp-go'},'Create video'),close=h('button',{class:'btn',id:'rp-close'},'Close');
+  const fmtChips=h('div',{class:'chips'});const fmtSet=f=>{replayFmt=f;[...fmtChips.children].forEach(c=>c.setAttribute('aria-pressed',String(c.dataset.f===f)));go.textContent=f==='gif'?'Create GIF':'Create video';};
+  for(const[f,t]of[['video','Video (MP4)'],['gif','Animated GIF (loops, can go on the board)']])fmtChips.append(h('button',{type:'button',class:'chip','data-f':f,'aria-pressed':String(f===replayFmt),onclick:()=>fmtSet(f)},t));
   const xBtn=h('button',{type:'button',class:'dlgx','aria-label':'Close',title:'Close',onclick:()=>close.click()},'✕');
   const dlg=h('div',{id:'replaydlg',class:'dlg',role:'dialog','aria-label':'Export replay video'},h('div',{class:'dlghead'},h('b',{style:'font-size:15px'},target?'Download video':'Export replay video'),xBtn),
+    h('div',{class:'ctl'},h('span',{class:'ctl-h'},'Save as'),fmtChips,h('span',{class:'hint'},'A GIF has no sound, is limited to 480 px wide, and loops forever.')),
     h('div',{class:'ctl'},h('span',{class:'ctl-h'},'Video length'),chips,h('div',{class:'row musrow'},lenSl,lenOut),h('span',{class:'hint'},'Drag to set any length from 3 s to 10 min.')),h('label',{class:'ctl'},h('span',{class:'ctl-h'},'What draws in the video'),penSel),
     h('div',{class:'ctl'},h('span',{class:'ctl-h'},'Background music'),h('div',{class:'row musrow'},musSel,prevBtn),h('div',{class:'row musrow'},h('span',{class:'hint'},'Volume'),vol)),
     h('label',{class:'tog'},sndCb,h('span',null,'Add pen scratching sound')),target?h('label',{class:'tog'},covCb,h('span',null,'Start with the original picture as the cover')):null,target?h('label',{class:'tog'},pkCb,h('span',null,'Flash the original picture now and then while drawing')):null,target?pkBox:null,target?h('label',{class:'tog'},revCb,h('span',null,'Fade in the original picture at the end')):null,target&&target.grid?h('label',{class:'tog'},bookCb,h('span',null,'Comic-book mode: every grid cell becomes a page, and the pages turn')):null,target&&target.grid?h('div',{class:'ctl'},h('span',{class:'ctl-h'},'Time to turn each page (0.02–2 s)'),h('div',{class:'row'},flipSl,flipOut)):null,target&&target.grid?h('label',{class:'tog'},flipOnlyCb,h('span',null,'Only make the page-turning ending (skip the drawing)')):null,target&&target.grid?h('label',{class:'tog'},srcCb,h('span',null,'Turn pages cut straight from the original picture (no drawing)')):null,status,bar,h('div',{class:'row'},go,close));
   let busy=false,prevVid=null,prevBox2=null;
   close.onclick=()=>{if(recJob)recJob.cancel();Aud.stopPrev(prevBtn);dlg.remove();};
   go.onclick=async()=>{if(busy)return;busy=true;go.disabled=true;close.textContent='Cancel';status.textContent='Starting…';const wantSound=replaySnd||replayMusic!=='none';
-    try{const out=await makeReplayVideo(replaySec,replayPen,(p,m)=>{bar.firstChild.style.width=Math.round(p*100)+'%';if(m)status.textContent=m;},{res:target,book:!!(replayBook&&target&&target.grid),flipDur:replayFlipT,flipOnly:!!(replayBook&&(replayFlipOnly||replaySrc)&&target&&target.grid),srcPages:!!(replayBook&&replaySrc&&target&&target.grid),reveal:replayRev,cover:replayCover,peek:replayPeek&&target?{every:replayPeekEvery,hold:replayPeekHold}:null,sound:replaySnd,music:replayMusic,musicVol:replayMusicVol/100,prof:target&&target.tip||'pencil'});
-      if(!out){status.textContent='Cancelled.';}else{bar.firstChild.style.width='100%';const fname=(target?'drawing-video.':'whiteboard-replay.')+out.ext;
+    try{const gifMode=replayFmt==='gif';const out=await (gifMode?recordGif:makeReplayVideo)(replaySec,replayPen,(p,m)=>{bar.firstChild.style.width=Math.round(p*100)+'%';if(m)status.textContent=m;},{res:target,book:!!(replayBook&&target&&target.grid),flipDur:replayFlipT,flipOnly:!!(replayBook&&(replayFlipOnly||replaySrc)&&target&&target.grid),srcPages:!!(replayBook&&replaySrc&&target&&target.grid),reveal:replayRev,cover:replayCover,peek:replayPeek&&target?{every:replayPeekEvery,hold:replayPeekHold}:null,sound:replaySnd,music:replayMusic,musicVol:replayMusicVol/100,prof:target&&target.tip||'pencil'});
+      if(!out){status.textContent='Cancelled.';}else{bar.firstChild.style.width='100%';const fname=(target?(out.ext==='gif'?'drawing-animation.':'drawing-video.'):'whiteboard-replay.')+out.ext;
         const au=out.audio?(out.audio==='live'?' with sound':' with '+out.audio.toUpperCase()+' sound'+(out.verified?' (checked)':'')+(out.level?' · loudness '+(20*Math.log10(out.level)).toFixed(0)+' dB':'')):(wantSound?' — no sound could be added in this browser':'');
         status.textContent=(out.mode==='fast'?'Finished in '+out.secs.toFixed(1)+' s':'Finished')+au+(out.audio==='opus'?'. Opus audio plays in browsers and VLC; some phone galleries stay silent.':'.');
         if(prevBox2){const v0=prevBox2.querySelector('video');if(v0)URL.revokeObjectURL(v0.src);prevBox2.remove();}
-        prevVid=h('video',{controls:true,playsinline:true,preload:'metadata',src:URL.createObjectURL(out.blob),style:'width:100%;max-height:min(40vh,300px);object-fit:contain;border-radius:8px;background:#000;display:block'});prevVid.setAttribute('webkit-playsinline','');
-        const saveBtn=h('button',{type:'button',class:'btn primary',onclick:async()=>{await saveFile(out.blob,fname);}},'Save video'),doneBtn=h('button',{type:'button',class:'btn',onclick:()=>close.click()},'Close');
-        prevBox2=h('div',{class:'ctl',id:'rp-result'},h('span',{class:'ctl-h'},'Your video is ready'),prevVid,h('div',{class:'row'},saveBtn,doneBtn));dlg.querySelector('.dlghead').after(prevBox2);try{dlg.scrollTo({top:0,behavior:'smooth'});}catch(e){}}}
+        if(out.ext==='gif'){prevVid=h('img',{src:URL.createObjectURL(out.blob),style:'width:100%;max-height:min(40vh,300px);object-fit:contain;border-radius:8px;background:#fff;display:block'});}else{prevVid=h('video',{controls:true,playsinline:true,preload:'metadata',src:URL.createObjectURL(out.blob),style:'width:100%;max-height:min(40vh,300px);object-fit:contain;border-radius:8px;background:#000;display:block'});prevVid.setAttribute('webkit-playsinline','');}
+        const saveBtn=h('button',{type:'button',class:'btn primary',onclick:async()=>{await saveFile(out.blob,fname);}},out.ext==='gif'?'Save GIF':'Save video'),putBtn=out.ext==='gif'?h('button',{type:'button',class:'btn',id:'rp-put',onclick:async()=>{const [w]=await openFiles([new File([out.blob],fname,{type:'image/gif'})]);if(w)setActive(w.id);toast('Added to the board — it plays in a loop');}},'Put on the board'):null,doneBtn=h('button',{type:'button',class:'btn',onclick:()=>close.click()},'Close');
+        prevBox2=h('div',{class:'ctl',id:'rp-result'},h('span',{class:'ctl-h'},out.ext==='gif'?'Your animation is ready':'Your video is ready'),prevVid,h('div',{class:'row'},saveBtn,putBtn,doneBtn));dlg.querySelector('.dlghead').after(prevBox2);try{dlg.scrollTo({top:0,behavior:'smooth'});}catch(e){}}}
     catch(e){status.textContent='Failed: '+e.message;}finally{busy=false;go.disabled=false;close.textContent='Close';}};
   $('#app').append(dlg);}
 
@@ -9558,6 +9697,49 @@ function openVideoDlg(w){
   sync();$('#app').append(dlg);}
 actions.push({id:'vid',icon:'video',title:'Redraw this video as hand-drawn shots',when:w=>w.kind==='video',run:w=>openVideoDlg(w)});
 
+/* ============ animated GIF export: median-cut palette + LZW + changed-rectangle frames ============ */
+const GIF={
+  palette(hist){ // hist: Uint32Array(32768) of 5-5-5 colour counts -> {pal:Uint8Array(768), n}
+    const keys=[];for(let k=0;k<32768;k++)if(hist[k])keys.push(k);
+    const ch=(k,c)=>c===0?(k>>10)&31:c===1?(k>>5)&31:k&31;
+    const mk=ks=>{let lo=[31,31,31],hi=[0,0,0],n=0;for(const k of ks){n+=hist[k];for(let c=0;c<3;c++){const v=ch(k,c);if(v<lo[c])lo[c]=v;if(v>hi[c])hi[c]=v;}}return{ks,n,lo,hi};};
+    const boxes=[mk(keys)];
+    while(boxes.length<256){let bi=-1,bs=0;for(let i=0;i<boxes.length;i++){const b=boxes[i];if(b.ks.length<2)continue;const r=Math.max(b.hi[0]-b.lo[0],b.hi[1]-b.lo[1],b.hi[2]-b.lo[2])+1,sc=b.n*r;if(sc>bs){bs=sc;bi=i;}}
+      if(bi<0)break;const b=boxes[bi];let c=0,rg=-1;for(let q=0;q<3;q++){const r=b.hi[q]-b.lo[q];if(r>rg){rg=r;c=q;}}
+      b.ks.sort((x,y)=>ch(x,c)-ch(y,c));let acc=0,cut=1;for(let i=0;i<b.ks.length;i++){acc+=hist[b.ks[i]];if(acc>=b.n/2){cut=Math.min(Math.max(i+1,1),b.ks.length-1);break;}}
+      boxes.splice(bi,1,mk(b.ks.slice(0,cut)),mk(b.ks.slice(cut)));}
+    const pal=new Uint8Array(768);boxes.forEach((b,i)=>{let r=0,g=0,bl=0;for(const k of b.ks){const w=hist[k];r+=((k>>10)&31)*w;g+=((k>>5)&31)*w;bl+=(k&31)*w;}const n=b.n||1;
+      const e=v=>{v=Math.round(v/n);return(v<<3)|(v>>2);};pal[i*3]=e(r);pal[i*3+1]=e(g);pal[i*3+2]=e(bl);});
+    return{pal,n:boxes.length};
+  },
+  lut(pal,n){const L=new Int16Array(32768).fill(-1);return k=>{let v=L[k];if(v>=0)return v;const r=((k>>10)&31)*8+4,g=((k>>5)&31)*8+4,b=(k&31)*8+4;let bd=1e9;v=0;for(let i=0;i<n;i++){const d=(pal[i*3]-r)**2+(pal[i*3+1]-g)**2+(pal[i*3+2]-b)**2;if(d<bd){bd=d;v=i;}}return L[k]=v;};},
+  lzw(idx,out){ // 8-bit indices, minimum code size 8
+    const TAB=new Int32Array(1<<20),ST=new Int32Array(1<<20);let epoch=1,nb=9,next=258,buf=0,bits=0,blk=[];
+    const flushBlk=()=>{if(blk.length){out.push(blk.length,...blk);blk=[];}};
+    const emit=c=>{buf|=c<<bits;bits+=nb;while(bits>=8){blk.push(buf&255);buf>>=8;bits-=8;if(blk.length===255)flushBlk();}};
+    emit(256);let prefix=idx[0];
+    for(let i=1;i<idx.length;i++){const k=idx[i],key=(prefix<<8)|k;if(ST[key]===epoch){prefix=TAB[key];continue;}
+      emit(prefix);if(next>(1<<nb)-1&&nb<12)nb++;
+      if(next<4096){TAB[key]=next++;ST[key]=epoch;}else{emit(256);epoch++;next=258;nb=9;}
+      prefix=k;}
+    emit(prefix);emit(257);if(bits>0)blk.push(buf&255);flushBlk();out.push(0);
+  },
+  /* frames: [{k:Uint16Array(w*h) of 5-5-5 keys}], delays in 1/100 s */
+  encode(frames,w,h,delays,pal,n){
+    const lut=GIF.lut(pal,n),out=[71,73,70,56,57,97,w&255,w>>8,h&255,h>>8,0xF7,0,0];for(let i=0;i<768;i++)out.push(pal[i]);
+    out.push(0x21,0xFF,11,78,69,84,83,67,65,80,69,50,46,48,3,1,0,0,0); // loop forever
+    let prev=null;
+    frames.forEach((F,fi)=>{const idx=new Uint8Array(w*h);for(let i=0;i<idx.length;i++)idx[i]=lut(F[i]);
+      let x0=0,y0=0,x1=w-1,y1=h-1;
+      if(prev){x0=w;y0=h;x1=-1;y1=-1;for(let y=0;y<h;y++){const o=y*w;for(let x=0;x<w;x++)if(idx[o+x]!==prev[o+x]){if(x<x0)x0=x;if(x>x1)x1=x;if(y<y0)y0=y;if(y>y1)y1=y;}}
+        if(x1<0){x0=y0=0;x1=y1=0;}}
+      const rw=x1-x0+1,rh=y1-y0+1,sub=new Uint8Array(rw*rh);for(let y=0;y<rh;y++)sub.set(idx.subarray((y0+y)*w+x0,(y0+y)*w+x0+rw),y*rw);
+      const d=delays[fi];out.push(0x21,0xF9,4,0x04,d&255,d>>8,0,0); // disposal 1: leave in place
+      out.push(0x2C,x0&255,x0>>8,y0&255,y0>>8,rw&255,rw>>8,rh&255,rh>>8,0,8);GIF.lzw(sub,out);prev=idx;});
+    out.push(0x3B);return new Blob([new Uint8Array(out)],{type:'image/gif'});
+  }
+};
+
 /* ============ persistence (per-viewer convenience) ============ */
 let saveT=0,warned=false,saving=false,saveCost=0,vidBusy=false;
 const busyBulk=()=>vidBusy||(typeof flowRun!=='undefined'&&!!flowRun);
@@ -9568,9 +9750,9 @@ const idb=()=>new Promise((res,rej)=>{try{const r=indexedDB.open('whiteboard-os'
 async function kv(mode,k,v){const db=await idb();return new Promise((res,rej)=>{const tx=db.transaction('kv',mode==='get'?'readonly':'readwrite'),st=tx.objectStore('kv'),r=mode==='get'?st.get(k):st.put(v,k);tx.oncomplete=()=>res(r.result);tx.onerror=()=>rej(tx.error);tx.onabort=()=>rej(tx.error);});}
 async function save(){saving=true;const t0=performance.now();try{const snap={v:1,cam:{...cam},idc,zTop,results,
   wins:[...wins.values()].map(w=>({id:w.id,name:w.name,mime:w.mime,blob:w.text!=null?null:w.blob,text:w.text,x:w.x,y:w.y,w:w.w,h:w.h,z:w.z,min:w.min})),
-  paper:paperId,strokes:strokes.map(s=>({p:s.p,c:s.c,w:s.w,g:s.g,a:s.a,b:s.b,wv:s.wv,f:s.f,r:s.r})),flows:flowSnap()};await kv('put','board',snap);$('#saved').textContent='saved locally';}catch(e){$('#saved').textContent='not saved';if(!warned){warned=true;}}finally{saving=false;saveCost=performance.now()-t0;}}
+  paper:paperId,strokes:strokes.map(s=>({p:s.p,c:s.c,w:s.w,g:s.g,a:s.a,b:s.b,wv:s.wv,sp:s.sp,ph:s.ph,f:s.f,r:s.r})),flows:flowSnap()};await kv('put','board',snap);$('#saved').textContent='saved locally';}catch(e){$('#saved').textContent='not saved';if(!warned){warned=true;}}finally{saving=false;saveCost=performance.now()-t0;}}
 async function restore(){try{const s=await kv('get','board');if(!s||!s.wins)return false;Object.assign(cam,s.cam);idc=s.idc||1;zTop=s.zTop||10;if(s.paper&&PAPERS[s.paper])setPaper(s.paper,true);if(typeof syncPaperUI==='function')syncPaperUI();
-  for(const w of s.wins)await createWindow({...w,restore:true});for(const o of s.strokes){const m=mkStroke(o.p,o.c,o.w,o.g,o.a);if(o.b)m.b=o.b;if(o.wv)m.wv=o.wv;if(o.f)m.f=o.f;if(o.r!=null)m.r=o.r;if(o.b)bbox(m);strokes.push(m);}results.push(...(s.results||[]));renderResults();flowRestore(s.flows);applyCam();
+  for(const w of s.wins)await createWindow({...w,restore:true});for(const o of s.strokes){const m=mkStroke(o.p,o.c,o.w,o.g,o.a);if(o.b)m.b=o.b;if(o.wv)m.wv=o.wv;if(o.sp)m.sp=o.sp;if(o.ph)m.ph=o.ph;if(o.f)m.f=o.f;if(o.r!=null)m.r=o.r;if(o.b)bbox(m);strokes.push(m);}results.push(...(s.results||[]));renderResults();flowRestore(s.flows);applyCam();
   return s.wins.length>0||s.strokes.length>0;}catch{return false;}}
 
 /* ============ seed content ============ */
@@ -9643,7 +9825,7 @@ I18N.set(I18N.initial());
   setTimeout(()=>{if(!had)fitAll(0);},50);
   function fitAllIfOffscreen(){}
 })();
-window.__wb={composeImage,pieceList,layoutPieces,replayRig,recommend,exportPNG,recordMB,recordReplay,makeReplayVideo,recordFast,Aud,setFocus,contentBounds,B,startMood,setTip:v=>{tipPref=v;},PRESETS,wins,strokes,cam,openFiles,api,plugins,get tool(){return tool;},setTool,handwrite:(...a)=>plugins[0].handwrite(...a),DEF,results,fitAll,undo,redo,eraseAt};
+window.__wb={composeImage,pieceList,layoutPieces,replayRig,recordGif,recommend,exportPNG,recordMB,recordReplay,makeReplayVideo,recordFast,Aud,setFocus,contentBounds,B,startMood,setTip:v=>{tipPref=v;},PRESETS,wins,strokes,cam,openFiles,api,plugins,get tool(){return tool;},setTool,handwrite:(...a)=>plugins[0].handwrite(...a),DEF,results,fitAll,undo,redo,eraseAt};
 })();
 
 </script>
